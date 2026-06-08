@@ -12,9 +12,9 @@ class Settings(BaseSettings):
     email_password: str
     email_recipient: str
     max_file_size_mb: int = 10
-    chunk_size: int = 500
-    chunk_overlap: int = 50
-    top_k_results: int = 3
+    chunk_size: int = 400
+    chunk_overlap: int = 60
+    top_k_results: int = 6
     cors_origin: str = "http://localhost:3000"
     env: str = "development"
 
