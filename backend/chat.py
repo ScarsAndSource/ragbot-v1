@@ -3,6 +3,7 @@ import time
 import logging
 from groq import Groq, APIStatusError, APIConnectionError
 from config import get_settings
+from typing import Optional
 from rag import retrieve_chunks_hybrid
 
 settings = get_settings()
