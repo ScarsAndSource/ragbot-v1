@@ -5,6 +5,7 @@ from groq import Groq, APIStatusError, APIConnectionError
 from config import get_settings
 from typing import Optional
 from rag import retrieve_chunks_hybrid
+from reranker import rerank_chunks
 
 settings = get_settings()
 client = Groq(api_key=settings.groq_api_key)
@@ -267,7 +268,11 @@ def get_chat_response(
             [],
         )
 
-    context = "\n\n---\n\n".join(chunks)
+    # Step 2: Rerank narrow — Cohere scores each chunk against the query
+    # top_k_reranked (5) best chunks go to the LLM
+    top_chunks = rerank_chunks(clean_message, chunks)
+
+    context = "\n\n---\n\n".join(top_chunks)
     system_prompt = SYSTEM_PROMPT_TEMPLATE.format(context=context)
 
     messages = [{"role": "system", "content": system_prompt}]
@@ -284,4 +289,4 @@ def get_chat_response(
     # FIX 9: Intent-based lead detection
     lead_triggered = detect_lead(clean_message, reply)
 
-    return reply, lead_triggered, chunks
+    return reply, lead_triggered, top_chunks
