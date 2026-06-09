@@ -6,16 +6,13 @@ settings = get_settings()
 logger = logging.getLogger("ragbot.reranker")
 
 # ── Lazy client initialization ────────────────────────────────────────────────
-# Client is only created if cohere_api_key is set in config.
-# If the key is missing or empty, all rerank calls fall back gracefully
-# to returning the top N raw chunks in their original hybrid-search order.
 _cohere_client = None
 
 
 def _get_client() -> cohere.Client | None:
     """
-    Return a Cohere client, initializing it on first call.
-    Returns None if no API key is configured — callers must handle this.
+    Return a Cohere client, initializing on first call.
+    Returns None if COHERE_API_KEY is not configured.
     """
     global _cohere_client
     if _cohere_client is None:
@@ -25,58 +22,66 @@ def _get_client() -> cohere.Client | None:
         else:
             logger.warning(
                 "COHERE_API_KEY not set — reranker disabled. "
-                "Retrieval will return raw hybrid-search order."
+                "All queries will use raw hybrid-search order. "
+                "Output guardrail will be disabled (no relevance scores available)."
             )
     return _cohere_client
 
 
-def rerank_chunks(query: str, chunks: list[str], top_n: int = None) -> list[str]:
+def rerank_chunks(
+    query: str,
+    chunks: list[str],
+    top_n: int | None = None,
+) -> tuple[list[str], float]:
     """
-    Rerank a list of retrieved chunks by relevance to the query using
-    Cohere's cross-encoder rerank model.
-
-    What this does that embedding similarity can't:
-    Cross-encoders read the query AND each chunk together as a pair,
-    scoring how well they match. Embedding similarity only compares
-    independent vectors — it doesn't understand the relationship between
-    the two texts. Cohere's model scores that relationship directly.
-
-    Args:
-        query:   The user's question (original, not HyDE-expanded)
-        chunks:  List of retrieved chunk strings from hybrid search
-        top_n:   How many top chunks to return. Defaults to top_k_reranked
-                 from config (5).
+    Rerank chunks using Cohere's cross-encoder model.
 
     Returns:
-        List of top_n chunks sorted by Cohere relevance score, highest first.
-        Falls back to chunks[:top_n] in original order if Cohere is
-        unavailable or the API call fails.
+        (reranked_chunks, top_relevance_score)
+
+        reranked_chunks    — top_n chunks sorted by Cohere relevance, best first
+        top_relevance_score — Cohere's score for the best chunk (0.0 to 1.0)
+                              Used by the output guardrail in chat.py to decide
+                              whether the LLM had strong enough context to answer.
+
+    Score interpretation:
+        > 0.60  — strong context match, LLM should answer accurately
+        0.20–0.60 — moderate match, answer likely grounded but may be incomplete
+        < 0.20  — weak match, context is probably irrelevant to the query —
+                  guardrail will override the LLM response
+
+    Fallback score when Cohere unavailable or API fails:
+        Returns 1.0 — fail open. Guardrail disabled rather than blocking all answers.
+        Better to risk a thin answer than to block legitimate responses.
     """
     if top_n is None:
         top_n = settings.top_k_reranked
 
-    # Edge cases — nothing to rerank
+    # Edge case — no chunks
     if not chunks:
         logger.warning("rerank_chunks called with empty chunk list")
-        return []
+        return [], 1.0
 
-    # If we have fewer or equal chunks than requested, no reranking needed
+    # No reranking needed if chunks already fit in top_n
     if len(chunks) <= top_n:
         logger.info(
-            "Skipping rerank — only %d chunks available, requested top_%d",
+            "Skipping rerank — only %d chunks, requested top_%d — "
+            "returning as-is with score 1.0",
             len(chunks),
             top_n,
         )
-        return chunks
+        return chunks, 1.0
 
-    # Get client — may be None if key not configured
     client = _get_client()
 
+    # Cohere not configured — return raw order, fail open on score
     if client is None:
         logger.info(
-            "Reranker not available — returning top %d chunks in retrieval order", top_n
+            "Reranker not available — returning top %d chunks in retrieval order "
+            "with fallback score 1.0 (guardrail disabled)",
+            top_n,
         )
-        return chunks[:top_n]
+        return chunks[:top_n], 1.0
 
     # ── Call Cohere Rerank API ────────────────────────────────────────────────
     try:
@@ -87,28 +92,33 @@ def rerank_chunks(query: str, chunks: list[str], top_n: int = None) -> list[str]
             top_n=top_n,
         )
 
-        # response.results is sorted by relevance_score descending (best first)
-        # r.index is the position of the chunk in the original chunks list
         reranked = [chunks[r.index] for r in response.results]
 
-        logger.info(
-            "Cohere rerank complete — input: %d chunks → output: %d chunks | "
-            "top score: %.3f | bottom score: %.3f",
-            len(chunks),
-            len(reranked),
-            response.results[0].relevance_score if response.results else 0,
-            response.results[-1].relevance_score if response.results else 0,
+        # Top score — first result is highest scored (results sorted descending)
+        top_score = (
+            float(response.results[0].relevance_score) if response.results else 1.0
+        )
+        bottom_score = (
+            float(response.results[-1].relevance_score) if response.results else 1.0
         )
 
-        return reranked
+        logger.info(
+            "Cohere rerank complete — input: %d → output: %d | "
+            "top_score: %.3f | bottom_score: %.3f",
+            len(chunks),
+            len(reranked),
+            top_score,
+            bottom_score,
+        )
+
+        return reranked, top_score
 
     except Exception as exc:
-        # Never let a reranker failure break the chat pipeline.
-        # Log it, fall back to raw order, keep serving the user.
+        # Cohere API failed — fail open, don't let reranker failure break chat
         logger.error(
-            "Cohere rerank API call failed: %s — "
-            "falling back to raw retrieval order, returning top %d",
+            "Cohere rerank API failed: %s — "
+            "returning raw order top %d with fallback score 1.0",
             exc,
             top_n,
         )
-        return chunks[:top_n]
+        return chunks[:top_n], 1.0

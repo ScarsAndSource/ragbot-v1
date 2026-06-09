@@ -36,6 +36,9 @@ class Settings(BaseSettings):
     cache_similarity_threshold: float = 0.92
     cache_max_size: int = 100
 
+    # ── Output guardrail ──────────────────────────────────────────────────────
+    guardrail_min_rerank_score: float = 0.20
+
     # ── CORS + env ────────────────────────────────────────────────────────────
     cors_origin: str = "http://localhost:3000"
     env: str = "development"
