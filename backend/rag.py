@@ -1,6 +1,5 @@
-import os
 import logging
-import numpy as np
+
 from pypdf import PdfReader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from sentence_transformers import SentenceTransformer
@@ -23,8 +22,7 @@ logger = logging.getLogger("ragbot.rag")
 embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
 
 chroma_client = chromadb.PersistentClient(
-    path="vectorstore/",
-    settings=ChromaSettings(anonymized_telemetry=False)
+    path="vectorstore/", settings=ChromaSettings(anonymized_telemetry=False)
 )
 
 # ── BM25 in-memory store ───────────────────────────────────────────────────────
@@ -36,6 +34,7 @@ _bm25_store: dict[str, tuple[BM25Okapi, list[str]]] = {}
 
 # ── PDF validation ────────────────────────────────────────────────────────────
 _PDF_MAGIC = b"%PDF-"
+
 
 def validate_pdf_bytes(data: bytes) -> bool:
     """
@@ -75,7 +74,8 @@ def extract_text_from_pdf(file_path: str) -> tuple[str, int]:
     if image_only_pages > 0:
         logger.warning(
             "PDF has %d/%d image-only pages — those will be skipped.",
-            image_only_pages, page_count,
+            image_only_pages,
+            page_count,
         )
 
     return full_text, page_count
@@ -90,7 +90,7 @@ def chunk_text(text: str) -> list[str]:
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=settings.chunk_size,
         chunk_overlap=settings.chunk_overlap,
-        separators=["\n\n", "\n", ".", "!", "?", " "]
+        separators=["\n\n", "\n", ".", "!", "?", " "],
     )
     chunks = splitter.split_text(text)
     return [c.strip() for c in chunks if len(c.strip()) > 50]
@@ -100,10 +100,10 @@ def chunk_text(text: str) -> list[str]:
 def store_chunks(session_id: str, chunks: list[str]) -> str:
     """
     Store chunks in two indexes simultaneously:
-    
+
     1. ChromaDB collection (vector search) — cosine similarity via embeddings
     2. BM25 in-memory index (keyword search) — exact token matching
-    
+
     Both indexes are built from the same chunk list.
     retrieve_chunks_hybrid() queries both and merges results via RRF.
     """
@@ -116,15 +116,14 @@ def store_chunks(session_id: str, chunks: list[str]) -> str:
         pass
 
     collection = chroma_client.create_collection(
-        name=collection_name,
-        metadata={"hnsw:space": "cosine"}
+        name=collection_name, metadata={"hnsw:space": "cosine"}
     )
 
     embeddings = embedding_model.encode(chunks).tolist()
     collection.add(
         documents=chunks,
         embeddings=embeddings,
-        ids=[f"chunk_{i}" for i in range(len(chunks))]
+        ids=[f"chunk_{i}" for i in range(len(chunks))],
     )
 
     # ── BM25: tokenize chunks and build keyword index ─────────────────────────
@@ -135,7 +134,8 @@ def store_chunks(session_id: str, chunks: list[str]) -> str:
 
     logger.info(
         "Indexed %d chunks for session=%s — ChromaDB (vector) + BM25 (keyword) both ready",
-        len(chunks), session_id
+        len(chunks),
+        session_id,
     )
 
     return collection_name
@@ -168,7 +168,9 @@ def _reciprocal_rank_fusion(ranked_lists: list[list[str]], k: int = 60) -> list[
 
 
 # ── Hybrid retrieval ──────────────────────────────────────────────────────────
-def retrieve_chunks_hybrid(session_id: str, query: str, top_k: int = None) -> list[str]:
+def retrieve_chunks_hybrid(
+    session_id: str, query: str, top_k: Optional[int] = None
+) -> list[str]:
     """
     PRIMARY RETRIEVAL FUNCTION — use this everywhere, not retrieve_chunks().
 
@@ -201,7 +203,7 @@ def retrieve_chunks_hybrid(session_id: str, query: str, top_k: int = None) -> li
 
         results = collection.query(
             query_embeddings=query_embedding,
-            n_results=min(n_candidates, collection.count())
+            n_results=min(n_candidates, collection.count()),
         )
         vector_ranked = results["documents"][0] if results["documents"] else []
 
@@ -230,20 +232,21 @@ def retrieve_chunks_hybrid(session_id: str, query: str, top_k: int = None) -> li
             bm25_ranked = [chunk for chunk, _ in scored[:n_candidates]]
             logger.info(
                 "BM25 keyword matches: %d chunks for session=%s",
-                len(bm25_ranked), session_id
+                len(bm25_ranked),
+                session_id,
             )
         else:
             logger.info(
                 "BM25: zero keyword matches for this query in session=%s "
                 "— query words not present verbatim in any chunk",
-                session_id
+                session_id,
             )
     else:
         logger.warning(
             "BM25 index not found for session=%s — "
             "server likely restarted after this session was created. "
             "Falling back to pure vector search.",
-            session_id
+            session_id,
         )
 
     # ── Step 3: Decide what to return ─────────────────────────────────────────
@@ -269,14 +272,16 @@ def retrieve_chunks_hybrid(session_id: str, query: str, top_k: int = None) -> li
         len(vector_ranked),
         len(bm25_ranked),
         len(fused),
-        min(top_k, len(fused))
+        min(top_k, len(fused)),
     )
 
     return fused[:top_k]
 
 
 # ── Legacy pure-vector retrieval (kept for backward compat) ───────────────────
-def retrieve_chunks(session_id: str, query: str, top_k: int = None) -> list[str]:
+def retrieve_chunks(
+    session_id: str, query: str, top_k: Optional[int] = None
+) -> list[str]:
     """
     Original pure-vector retrieval. Not used in the main pipeline anymore.
     retrieve_chunks_hybrid() is the correct function to call.
@@ -291,8 +296,7 @@ def retrieve_chunks(session_id: str, query: str, top_k: int = None) -> list[str]
         return []
     query_embedding = embedding_model.encode([query]).tolist()
     results = collection.query(
-        query_embeddings=query_embedding,
-        n_results=min(top_k, collection.count())
+        query_embeddings=query_embedding, n_results=min(top_k, collection.count())
     )
     return results["documents"][0] if results["documents"] else []
 

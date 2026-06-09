@@ -209,7 +209,7 @@ def _call_groq_with_retry(messages: list[dict]) -> str:
     len(_RETRY_DELAYS) times with exponential backoff.
     Raises the final exception if all retries fail.
     """
-    last_exc = None
+    last_exc: Optional[Exception] = None
     for attempt, delay in enumerate([0] + _RETRY_DELAYS, start=1):
         if delay:
             logger.warning(
