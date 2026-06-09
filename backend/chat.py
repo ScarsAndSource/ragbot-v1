@@ -6,6 +6,7 @@ from config import get_settings
 from typing import Optional
 from rag import retrieve_chunks_hybrid
 from reranker import rerank_chunks
+from cache import semantic_cache
 
 settings = get_settings()
 client = Groq(api_key=settings.groq_api_key)
@@ -260,6 +261,14 @@ def get_chat_response(
     if not clean_message:
         return "Please enter a message.", False, []
 
+    # ── Step 2: Semantic cache check ──────────────────────────────────────────
+    # Check before touching any external service.
+    # A cache hit skips hybrid search, Cohere rerank, and Groq entirely.
+    cached = semantic_cache.get(clean_message, session_id)
+    if cached is not None:
+        cached_answer, cached_lead, cached_chunks = cached
+        return cached_answer, cached_lead, cached_chunks
+
     chunks = retrieve_chunks_hybrid(session_id, clean_message)
     if not chunks:
         return (
@@ -287,6 +296,18 @@ def get_chat_response(
     reply = _call_groq_with_retry(messages)
 
     # FIX 9: Intent-based lead detection
+    # ── Step 7: Lead detection ────────────────────────────────────────────────
     lead_triggered = detect_lead(clean_message, reply)
+
+    # ── Step 8: Store result in semantic cache ────────────────────────────────
+    # Cache.set() handles its own skip logic (lead-triggered, empty answers).
+    # We pass top_chunks so cached responses return the same source display.
+    semantic_cache.set(
+        query=clean_message,
+        answer=reply,
+        session_id=session_id,
+        lead_triggered=lead_triggered,
+        chunks=top_chunks,
+    )
 
     return reply, lead_triggered, top_chunks

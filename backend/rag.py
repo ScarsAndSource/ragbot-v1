@@ -1,5 +1,4 @@
 import logging
-
 from pypdf import PdfReader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from sentence_transformers import SentenceTransformer
@@ -26,31 +25,21 @@ chroma_client = chromadb.PersistentClient(
 )
 
 # ── BM25 in-memory store ───────────────────────────────────────────────────────
-# Maps session_id → (BM25Okapi index, list of raw chunk strings)
-# Lives in memory — same lifecycle as ChromaDB on Render free tier.
-# If server restarts, both ChromaDB (free tier) and BM25 are wiped together.
-# retrieve_chunks_hybrid() has a fallback to pure vector if BM25 is missing.
-_bm25_store: dict[str, tuple[BM25Okapi, list[str]]] = {}
+# Maps session_id → (BM25Okapi index, child_chunks list, child_to_parent_ids list)
+# Third element is new in Phase 4: lets us map any child text → its parent index
+# without hitting ChromaDB for a metadata lookup.
+_bm25_store: dict[str, tuple[BM25Okapi, list[str], list[int]]] = {}
 
 # ── PDF validation ────────────────────────────────────────────────────────────
 _PDF_MAGIC = b"%PDF-"
 
 
 def validate_pdf_bytes(data: bytes) -> bool:
-    """
-    Check actual file magic bytes, not just MIME type.
-    A file renamed to .pdf with wrong content will fail here before
-    ever reaching pypdf.
-    """
     return data[:5] == _PDF_MAGIC
 
 
 # ── PDF text extraction ───────────────────────────────────────────────────────
 def extract_text_from_pdf(file_path: str) -> tuple[str, int]:
-    """
-    Extract all text from PDF. Returns (full_text, page_count).
-    Raises ValueError if PDF is fully image-only with no extractable text.
-    """
     reader = PdfReader(file_path)
     page_count = len(reader.pages)
     pages = []
@@ -81,233 +70,358 @@ def extract_text_from_pdf(file_path: str) -> tuple[str, int]:
     return full_text, page_count
 
 
-# ── Chunking ──────────────────────────────────────────────────────────────────
-def chunk_text(text: str) -> list[str]:
+# ── Hierarchical chunking ─────────────────────────────────────────────────────
+def chunk_text_hierarchical(text: str) -> tuple[list[str], list[str], list[int]]:
     """
-    Split text into chunks using recursive character splitting.
-    chunk_size and chunk_overlap are controlled via config.py.
+    Split text into two levels of chunks.
+
+    Parent chunks (1000 chars, 100 overlap):
+        Sent to the LLM. Large enough to contain a complete thought,
+        a full policy clause, a complete instruction sequence.
+        These are what Groq reads. Context-rich.
+
+    Child chunks (350 chars, 40 overlap):
+        Used for retrieval — searched by vector and BM25.
+        Small enough for embeddings to be precise and focused.
+        Each child knows which parent it came from via child_to_parent.
+
+    Why this works:
+        Search precision comes from small chunks.
+        Answer quality comes from large chunks.
+        Hierarchical chunking gives you both simultaneously.
+
+    Returns:
+        child_chunks     — list of small retrieval-target strings
+        parent_chunks    — list of large LLM-context strings
+        child_to_parent  — child_to_parent[i] = index of parent for child i
     """
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=settings.chunk_size,
-        chunk_overlap=settings.chunk_overlap,
+    parent_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=1000,
+        chunk_overlap=100,
         separators=["\n\n", "\n", ".", "!", "?", " "],
     )
-    chunks = splitter.split_text(text)
-    return [c.strip() for c in chunks if len(c.strip()) > 50]
+    child_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=350, chunk_overlap=40, separators=["\n\n", "\n", ".", "!", "?", " "]
+    )
+
+    parent_chunks = [
+        c.strip() for c in parent_splitter.split_text(text) if len(c.strip()) > 80
+    ]
+
+    if not parent_chunks:
+        raise ValueError("Could not extract any parent chunks from this document.")
+
+    child_chunks: list[str] = []
+    child_to_parent: list[int] = []
+
+    for parent_idx, parent in enumerate(parent_chunks):
+        children = child_splitter.split_text(parent)
+        children = [c.strip() for c in children if len(c.strip()) > 40]
+
+        # If parent is too short to split further, it becomes its own child
+        if not children:
+            children = [parent]
+
+        child_chunks.extend(children)
+        child_to_parent.extend([parent_idx] * len(children))
+
+    logger.info(
+        "Chunking complete — parents: %d | children: %d | avg children/parent: %.1f",
+        len(parent_chunks),
+        len(child_chunks),
+        len(child_chunks) / max(len(parent_chunks), 1),
+    )
+
+    return child_chunks, parent_chunks, child_to_parent
 
 
 # ── Storage ───────────────────────────────────────────────────────────────────
-def store_chunks(session_id: str, chunks: list[str]) -> str:
+def store_chunks_hierarchical(
+    session_id: str,
+    child_chunks: list[str],
+    parent_chunks: list[str],
+    child_to_parent: list[int],
+) -> None:
     """
-    Store chunks in two indexes simultaneously:
+    Build three indexes for a session:
 
-    1. ChromaDB collection (vector search) — cosine similarity via embeddings
-    2. BM25 in-memory index (keyword search) — exact token matching
+    1. ChromaDB child collection  — vector search on small, precise chunks
+    2. ChromaDB parent collection — fetch full-context chunks by ID
+    3. BM25 in-memory index       — keyword search on child chunks
 
-    Both indexes are built from the same chunk list.
-    retrieve_chunks_hybrid() queries both and merges results via RRF.
+    Child chunks carry metadata {"parent_id": int} so we can resolve
+    any retrieved child back to its parent during retrieval.
     """
-    collection_name = f"session_{session_id}"
+    child_col_name = f"session_{session_id}_child"
+    parent_col_name = f"session_{session_id}_parent"
 
-    # ── ChromaDB: delete stale collection, create fresh ───────────────────────
-    try:
-        chroma_client.delete_collection(collection_name)
-    except Exception:
-        pass
+    # Delete any existing collections for this session (including old flat ones)
+    for name in [child_col_name, parent_col_name, f"session_{session_id}"]:
+        try:
+            chroma_client.delete_collection(name)
+        except Exception:
+            pass
 
-    collection = chroma_client.create_collection(
-        name=collection_name, metadata={"hnsw:space": "cosine"}
+    # ── Child collection: embed + store with parent_id metadata ───────────────
+    child_col = chroma_client.create_collection(
+        name=child_col_name, metadata={"hnsw:space": "cosine"}
+    )
+    child_embeddings = embedding_model.encode(child_chunks).tolist()
+    child_col.add(
+        documents=child_chunks,
+        embeddings=child_embeddings,
+        ids=[f"child_{i}" for i in range(len(child_chunks))],
+        metadatas=[{"parent_id": child_to_parent[i]} for i in range(len(child_chunks))],
     )
 
-    embeddings = embedding_model.encode(chunks).tolist()
-    collection.add(
-        documents=chunks,
-        embeddings=embeddings,
-        ids=[f"chunk_{i}" for i in range(len(chunks))],
+    # ── Parent collection: embed + store (fetched by ID during retrieval) ─────
+    # We embed parents too so the collection is valid and future-queryable.
+    parent_col = chroma_client.create_collection(
+        name=parent_col_name, metadata={"hnsw:space": "cosine"}
+    )
+    parent_embeddings = embedding_model.encode(parent_chunks).tolist()
+    parent_col.add(
+        documents=parent_chunks,
+        embeddings=parent_embeddings,
+        ids=[f"parent_{i}" for i in range(len(parent_chunks))],
     )
 
-    # ── BM25: tokenize chunks and build keyword index ─────────────────────────
-    # Lowercase + whitespace tokenization — simple but effective for BM25
-    tokenized_chunks = [chunk.lower().split() for chunk in chunks]
-    bm25_index = BM25Okapi(tokenized_chunks)
-    _bm25_store[session_id] = (bm25_index, chunks)
+    # ── BM25 in-memory index on child chunks ──────────────────────────────────
+    tokenized_children = [chunk.lower().split() for chunk in child_chunks]
+    bm25_index = BM25Okapi(tokenized_children)
+
+    # Store (index, child texts, child→parent mapping) as a triple
+    _bm25_store[session_id] = (bm25_index, child_chunks, child_to_parent)
 
     logger.info(
-        "Indexed %d chunks for session=%s — ChromaDB (vector) + BM25 (keyword) both ready",
-        len(chunks),
+        "Indexes built — session=%s | parents=%d | children=%d | BM25 ready",
         session_id,
+        len(parent_chunks),
+        len(child_chunks),
     )
-
-    return collection_name
 
 
 # ── RRF fusion ────────────────────────────────────────────────────────────────
 def _reciprocal_rank_fusion(ranked_lists: list[list[str]], k: int = 60) -> list[str]:
     """
-    Merge multiple ranked lists of documents using Reciprocal Rank Fusion.
-
-    Formula: RRF_score(doc) = Σ  1 / (k + rank)
-    - rank is 1-indexed (first position = rank 1)
-    - k=60 is the standard constant from the original 2009 RRF paper
-    - A document that ranks highly in multiple lists gets a much higher fused score
-
-    Why this works: if a chunk is rank 1 in vector search AND rank 2 in BM25,
-    it scores 1/61 + 1/62 = 0.032. A chunk that only appears in one list at rank 5
-    scores 1/65 = 0.015. The dual-list champion wins decisively.
+    Merge multiple ranked lists via Reciprocal Rank Fusion.
+    RRF_score(doc) = Σ 1 / (k + rank), rank is 1-indexed.
+    k=60 is the standard constant from the 2009 paper.
     """
     scores: dict[str, float] = {}
-
     for ranked_list in ranked_lists:
         for rank_idx, doc in enumerate(ranked_list):
-            rank = rank_idx + 1  # 1-indexed
-            contribution = 1.0 / (k + rank)
-            scores[doc] = scores.get(doc, 0.0) + contribution
-
-    # Sort descending — highest fused score first
+            rank = rank_idx + 1
+            scores[doc] = scores.get(doc, 0.0) + 1.0 / (k + rank)
     return sorted(scores.keys(), key=lambda d: scores[d], reverse=True)
 
 
 # ── Hybrid retrieval ──────────────────────────────────────────────────────────
 def retrieve_chunks_hybrid(
-    session_id: str, query: str, top_k: Optional[int] = None
+    session_id: str,
+    query: str,
+    top_k: Optional[int] = None,
+    hyde_query: Optional[str] = None,
 ) -> list[str]:
     """
-    PRIMARY RETRIEVAL FUNCTION — use this everywhere, not retrieve_chunks().
+    Full hybrid retrieval pipeline with hierarchical parent resolution.
 
-    Runs vector search and BM25 keyword search in parallel, then merges
-    results using Reciprocal Rank Fusion. Returns top_k fused chunks.
+    Step 1 — Vector search on child collection
+        Uses hyde_query for embedding if provided (Phase 5 HyDE),
+        otherwise uses original query. Returns child texts + parent_id metadata.
 
-    Fallback behavior:
-    - If BM25 index is missing (server restarted) → pure vector search
-    - If vector search fails → pure BM25
-    - If both fail → empty list
+    Step 2 — BM25 keyword search on child chunks
+        Always uses original query — keyword search benefits from
+        the user's exact words, not a hypothetical document passage.
 
-    Each source retrieves (top_k * 3) candidates before fusion, so the
-    fusion has a wide pool to work with and can surface the best chunks
-    even if they ranked lower in one individual source.
+    Step 3 — RRF fusion
+        Merges vector and BM25 child ranked lists into one fused list.
+
+    Step 4 — Parent resolution
+        For each top child, look up its parent_id.
+        Fetch the full parent chunk from ChromaDB.
+        Deduplicate (multiple children can share a parent).
+
+    Returns parent chunks — large, context-rich strings ready for
+    the reranker and then the LLM.
+
+    Args:
+        query       — user's original question (used for BM25 + fallback vector)
+        hyde_query  — hypothetical document passage (used for vector if set)
+        top_k       — max number of unique parent chunks to return
     """
     if top_k is None:
         top_k = settings.top_k_results
 
-    # How many candidates to pull from each source before fusion
-    # More candidates = better fusion quality, but slightly slower
-    n_candidates = min(top_k * 3, 50)
+    # Pull more candidates than top_k — RRF needs a wide pool to work well
+    n_candidates = min(top_k * 3, 60)
 
-    collection_name = f"session_{session_id}"
+    child_col_name = f"session_{session_id}_child"
 
-    # ── Step 1: Vector search ─────────────────────────────────────────────────
-    vector_ranked: list[str] = []
+    # ── Step 1: Vector search on child collection ─────────────────────────────
+    vector_children: list[str] = []
+    # Maps child text → its parent_id — built from ChromaDB metadata
+    text_to_parent: dict[str, int] = {}
+
+    # For vector embedding: prefer HyDE query if available (Phase 5)
+    # HyDE bridges the phrasing gap between user language and document language
+    vector_query = hyde_query if hyde_query else query
+
     try:
-        collection = chroma_client.get_collection(collection_name)
-        query_embedding = embedding_model.encode([query]).tolist()
+        child_col = chroma_client.get_collection(child_col_name)
+        query_embedding = embedding_model.encode([vector_query]).tolist()
 
-        results = collection.query(
+        results = child_col.query(
             query_embeddings=query_embedding,
-            n_results=min(n_candidates, collection.count()),
+            n_results=min(n_candidates, child_col.count()),
+            include=["documents", "metadatas"],
         )
-        vector_ranked = results["documents"][0] if results["documents"] else []
+
+        if results["documents"] and results["documents"][0]:
+            vector_children = results["documents"][0]
+            # Build text→parent_id mapping from returned metadata
+            for i, doc in enumerate(vector_children):
+                meta = results["metadatas"][0][i]
+                parent_id = meta.get("parent_id")
+                if parent_id is not None:
+                    text_to_parent[doc] = int(parent_id)
 
     except Exception as exc:
         logger.warning("Vector search failed for session=%s: %s", session_id, exc)
 
-    # ── Step 2: BM25 keyword search ───────────────────────────────────────────
-    bm25_ranked: list[str] = []
+    # ── Step 2: BM25 keyword search on child chunks ───────────────────────────
+    bm25_children: list[str] = []
 
     if session_id in _bm25_store:
-        bm25_index, all_chunks = _bm25_store[session_id]
-        tokenized_query = query.lower().split()
+        bm25_index, all_children, child_to_parent_map = _bm25_store[session_id]
 
-        # get_scores returns a numpy array — one score per chunk
+        # BM25 always uses original query — exact user words matter here
+        tokenized_query = query.lower().split()
         bm25_scores = bm25_index.get_scores(tokenized_query)
 
-        # Only keep chunks with a positive BM25 score (actual keyword matches)
         scored = [
-            (all_chunks[i], float(bm25_scores[i]))
-            for i in range(len(all_chunks))
+            (all_children[i], float(bm25_scores[i]), child_to_parent_map[i])
+            for i in range(len(all_children))
             if bm25_scores[i] > 0.0
         ]
 
         if scored:
             scored.sort(key=lambda x: x[1], reverse=True)
-            bm25_ranked = [chunk for chunk, _ in scored[:n_candidates]]
+            for child_text, _, parent_id in scored[:n_candidates]:
+                bm25_children.append(child_text)
+                text_to_parent[child_text] = parent_id
+
             logger.info(
-                "BM25 keyword matches: %d chunks for session=%s",
-                len(bm25_ranked),
+                "BM25 keyword matches: %d children for session=%s",
+                len(bm25_children),
                 session_id,
             )
         else:
             logger.info(
-                "BM25: zero keyword matches for this query in session=%s "
-                "— query words not present verbatim in any chunk",
+                "BM25: no keyword matches for session=%s — "
+                "query words not present verbatim in any child chunk",
                 session_id,
             )
     else:
         logger.warning(
-            "BM25 index not found for session=%s — "
-            "server likely restarted after this session was created. "
-            "Falling back to pure vector search.",
+            "BM25 index missing for session=%s "
+            "(server restarted after upload?) — vector only",
             session_id,
         )
 
-    # ── Step 3: Decide what to return ─────────────────────────────────────────
-    if not vector_ranked and not bm25_ranked:
+    # ── Step 3: Handle empty results ─────────────────────────────────────────
+    if not vector_children and not bm25_children:
         logger.error("Both vector and BM25 returned empty for session=%s", session_id)
         return []
 
-    # Only one source available — return it directly, no fusion needed
-    if not bm25_ranked:
-        logger.info("Returning pure vector results (no BM25 candidates)")
-        return vector_ranked[:top_k]
-
-    if not vector_ranked:
-        logger.info("Returning pure BM25 results (vector search failed)")
-        return bm25_ranked[:top_k]
-
-    # ── Step 4: RRF fusion ────────────────────────────────────────────────────
-    fused = _reciprocal_rank_fusion([vector_ranked, bm25_ranked])
+    # ── Step 4: RRF fusion on child texts ─────────────────────────────────────
+    if not bm25_children:
+        top_children = vector_children
+    elif not vector_children:
+        top_children = bm25_children
+    else:
+        fused = _reciprocal_rank_fusion([vector_children, bm25_children])
+        top_children = fused
 
     logger.info(
-        "Hybrid RRF complete — session=%s | vector=%d | bm25=%d | fused=%d | returning=%d",
+        "Hybrid RRF — session=%s | vector=%d | bm25=%d | fused pool=%d",
         session_id,
-        len(vector_ranked),
-        len(bm25_ranked),
-        len(fused),
-        min(top_k, len(fused)),
+        len(vector_children),
+        len(bm25_children),
+        len(top_children),
     )
 
-    return fused[:top_k]
-
-
-# ── Legacy pure-vector retrieval (kept for backward compat) ───────────────────
-def retrieve_chunks(
-    session_id: str, query: str, top_k: Optional[int] = None
-) -> list[str]:
-    """
-    Original pure-vector retrieval. Not used in the main pipeline anymore.
-    retrieve_chunks_hybrid() is the correct function to call.
-    Kept here so nothing breaks if anything else references this by name.
-    """
-    if top_k is None:
-        top_k = settings.top_k_results
-    collection_name = f"session_{session_id}"
+    # ── Step 5: Resolve children → parent chunks ──────────────────────────────
     try:
-        collection = chroma_client.get_collection(collection_name)
-    except Exception:
-        return []
-    query_embedding = embedding_model.encode([query]).tolist()
-    results = collection.query(
-        query_embeddings=query_embedding, n_results=min(top_k, collection.count())
+        parent_col = chroma_client.get_collection(f"session_{session_id}_parent")
+    except Exception as exc:
+        # Parent collection missing — this shouldn't happen but degrade gracefully
+        logger.error(
+            "Parent collection not found for session=%s: %s — "
+            "returning raw children as fallback",
+            session_id,
+            exc,
+        )
+        return top_children[:top_k]
+
+    seen_parent_ids: set[int] = set()
+    parent_docs: list[str] = []
+
+    for child_text in top_children:
+        if len(parent_docs) >= top_k:
+            break
+
+        parent_id = text_to_parent.get(child_text)
+        if parent_id is None:
+            continue
+
+        if parent_id in seen_parent_ids:
+            # Multiple children mapped to same parent — skip duplicate
+            continue
+
+        seen_parent_ids.add(parent_id)
+
+        try:
+            result = parent_col.get(ids=[f"parent_{parent_id}"])
+            if result["documents"]:
+                parent_docs.append(result["documents"][0])
+        except Exception as exc:
+            logger.warning(
+                "Failed to fetch parent_%d for session=%s: %s",
+                parent_id,
+                session_id,
+                exc,
+            )
+
+    logger.info(
+        "Parent resolution — session=%s | unique parents fetched: %d | returning: %d",
+        session_id,
+        len(seen_parent_ids),
+        len(parent_docs),
     )
-    return results["documents"][0] if results["documents"] else []
+
+    return parent_docs
 
 
 # ── Session existence check ───────────────────────────────────────────────────
 def session_exists(session_id: str) -> bool:
+    """
+    Check for Phase 4 hierarchical collections first.
+    Falls back to legacy flat collection check for pre-Phase 4 sessions.
+    Pre-Phase 4 sessions cannot be retrieved with the new pipeline —
+    they'll need to be re-uploaded to get hierarchical indexes built.
+    """
     try:
-        chroma_client.get_collection(f"session_{session_id}")
+        chroma_client.get_collection(f"session_{session_id}_child")
         return True
     except Exception:
-        return False
+        try:
+            # Backward compat — old flat sessions still "exist" for session checks
+            # but retrieval will fail gracefully for them
+            chroma_client.get_collection(f"session_{session_id}")
+            return True
+        except Exception:
+            return False
 
 
 # ── Full PDF pipeline ─────────────────────────────────────────────────────────
@@ -318,17 +432,18 @@ def process_pdf(
     on_done: Optional[Callable] = None,
 ) -> tuple[int, int]:
     """
-    Full ingestion pipeline: extract → chunk → store (ChromaDB + BM25).
-    Returns (page_count, chunk_count).
+    Full ingestion pipeline: extract → hierarchical chunk → store.
+    Returns (page_count, child_chunk_count).
     """
     text, page_count = extract_text_from_pdf(file_path)
 
     if not text.strip():
         raise ValueError("PDF appears to be empty or image-only (no extractable text).")
 
-    chunks = chunk_text(text)
-    if not chunks:
-        raise ValueError("Could not extract meaningful text chunks from this PDF.")
+    child_chunks, parent_chunks, child_to_parent = chunk_text_hierarchical(text)
+
+    if not child_chunks:
+        raise ValueError("Could not extract meaningful chunks from this PDF.")
 
     if on_chunks_ready:
         try:
@@ -336,7 +451,7 @@ def process_pdf(
         except Exception:
             pass
 
-    store_chunks(session_id, chunks)
+    store_chunks_hierarchical(session_id, child_chunks, parent_chunks, child_to_parent)
 
     if on_done:
         try:
@@ -344,16 +459,15 @@ def process_pdf(
         except Exception:
             pass
 
-    return page_count, len(chunks)
+    # Return child count so upload response shows meaningful chunk count
+    return page_count, len(child_chunks)
 
 
 # ── Background cleanup stub ───────────────────────────────────────────────────
 def delete_old_collections(max_age_seconds: int = 86400):
     """
-    Cleanup stub. Full implementation would:
-    1. Track session creation timestamps in Redis
-    2. Delete ChromaDB collections older than max_age_seconds
-    3. Also pop the corresponding entry from _bm25_store
+    Cleanup stub. Full implementation would delete both _child and _parent
+    collections for expired sessions, and pop from _bm25_store.
     Render free tier wipes everything on redeploy anyway.
     """
     pass
