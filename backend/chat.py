@@ -242,7 +242,7 @@ def _call_groq_with_retry(messages: list[dict]) -> str:
             logger.warning("Groq connection error on attempt %d: %s", attempt, exc)
         except Exception:
             raise
-    raise last_exc
+    raise last_exc or RuntimeError("Groq call failed after all retries")
 
 
 # ── HyDE: Hypothetical Document Embeddings ────────────────────────────────────
