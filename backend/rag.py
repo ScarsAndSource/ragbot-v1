@@ -1,7 +1,7 @@
 import logging
 from pypdf import PdfReader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from sentence_transformers import SentenceTransformer
+import cohere
 from rank_bm25 import BM25Okapi
 import chromadb
 from chromadb.config import Settings as ChromaSettings
@@ -17,18 +17,54 @@ logging.getLogger("posthog").setLevel(logging.CRITICAL)
 
 logger = logging.getLogger("ragbot.rag")
 
-# ── Models and clients ────────────────────────────────────────────────────────
-embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
+# ── Cohere client ─────────────────────────────────────────────────────────────
+co = cohere.Client(settings.cohere_api_key)
 
 chroma_client = chromadb.PersistentClient(
     path="vectorstore/", settings=ChromaSettings(anonymized_telemetry=False)
 )
 
 # ── BM25 in-memory store ───────────────────────────────────────────────────────
-# Maps session_id → (BM25Okapi index, child_chunks list, child_to_parent_ids list)
-# Third element is new in Phase 4: lets us map any child text → its parent index
-# without hitting ChromaDB for a metadata lookup.
 _bm25_store: dict[str, tuple[BM25Okapi, list[str], list[int]]] = {}
+
+# ── Cohere embedding helpers ──────────────────────────────────────────────────
+_COHERE_EMBED_MODEL = "embed-english-v3.0"
+_COHERE_BATCH_SIZE = 96
+
+
+def _embed_documents(texts: list[str]) -> list[list[float]]:
+    """
+    Embed a list of document chunks via Cohere API.
+    Uses search_document input type for indexing.
+    Batches automatically for lists larger than 96.
+    Explicit float() cast on every value avoids Pylance type errors
+    from Cohere SDK returning str | Any in older type stubs.
+    """
+    all_embeddings: list[list[float]] = []
+    for i in range(0, len(texts), _COHERE_BATCH_SIZE):
+        batch = texts[i : i + _COHERE_BATCH_SIZE]
+        response = co.embed(
+            texts=batch,
+            model=_COHERE_EMBED_MODEL,
+            input_type="search_document",
+        )
+        all_embeddings.extend([[float(v) for v in row] for row in response.embeddings])
+    return all_embeddings
+
+
+def _embed_query(query: str) -> list[float]:
+    """
+    Embed a single query string via Cohere API.
+    Uses search_query input type — distinct from search_document,
+    improves retrieval quality on embed-english-v3.0.
+    """
+    response = co.embed(
+        texts=[query],
+        model=_COHERE_EMBED_MODEL,
+        input_type="search_query",
+    )
+    return [float(v) for v in list(response.embeddings)[0]]
+
 
 # ── PDF validation ────────────────────────────────────────────────────────────
 _PDF_MAGIC = b"%PDF-"
@@ -101,7 +137,9 @@ def chunk_text_hierarchical(text: str) -> tuple[list[str], list[str], list[int]]
         separators=["\n\n", "\n", ".", "!", "?", " "],
     )
     child_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=350, chunk_overlap=40, separators=["\n\n", "\n", ".", "!", "?", " "]
+        chunk_size=350,
+        chunk_overlap=40,
+        separators=["\n\n", "\n", ".", "!", "?", " "],
     )
 
     parent_chunks = [
@@ -118,7 +156,6 @@ def chunk_text_hierarchical(text: str) -> tuple[list[str], list[str], list[int]]
         children = child_splitter.split_text(parent)
         children = [c.strip() for c in children if len(c.strip()) > 40]
 
-        # If parent is too short to split further, it becomes its own child
         if not children:
             children = [parent]
 
@@ -155,18 +192,17 @@ def store_chunks_hierarchical(
     child_col_name = f"session_{session_id}_child"
     parent_col_name = f"session_{session_id}_parent"
 
-    # Delete any existing collections for this session (including old flat ones)
     for name in [child_col_name, parent_col_name, f"session_{session_id}"]:
         try:
             chroma_client.delete_collection(name)
         except Exception:
             pass
 
-    # ── Child collection: embed + store with parent_id metadata ───────────────
+    # ── Child collection ──────────────────────────────────────────────────────
     child_col = chroma_client.create_collection(
         name=child_col_name, metadata={"hnsw:space": "cosine"}
     )
-    child_embeddings = embedding_model.encode(child_chunks).tolist()
+    child_embeddings = _embed_documents(child_chunks)
     child_col.add(
         documents=child_chunks,
         embeddings=child_embeddings,
@@ -174,23 +210,20 @@ def store_chunks_hierarchical(
         metadatas=[{"parent_id": child_to_parent[i]} for i in range(len(child_chunks))],
     )
 
-    # ── Parent collection: embed + store (fetched by ID during retrieval) ─────
-    # We embed parents too so the collection is valid and future-queryable.
+    # ── Parent collection ─────────────────────────────────────────────────────
     parent_col = chroma_client.create_collection(
         name=parent_col_name, metadata={"hnsw:space": "cosine"}
     )
-    parent_embeddings = embedding_model.encode(parent_chunks).tolist()
+    parent_embeddings = _embed_documents(parent_chunks)
     parent_col.add(
         documents=parent_chunks,
         embeddings=parent_embeddings,
         ids=[f"parent_{i}" for i in range(len(parent_chunks))],
     )
 
-    # ── BM25 in-memory index on child chunks ──────────────────────────────────
+    # ── BM25 in-memory index ──────────────────────────────────────────────────
     tokenized_children = [chunk.lower().split() for chunk in child_chunks]
     bm25_index = BM25Okapi(tokenized_children)
-
-    # Store (index, child texts, child→parent mapping) as a triple
     _bm25_store[session_id] = (bm25_index, child_chunks, child_to_parent)
 
     logger.info(
@@ -205,7 +238,7 @@ def store_chunks_hierarchical(
 def _reciprocal_rank_fusion(ranked_lists: list[list[str]], k: int = 60) -> list[str]:
     """
     Merge multiple ranked lists via Reciprocal Rank Fusion.
-    RRF_score(doc) = Σ 1 / (k + rank), rank is 1-indexed.
+    RRF_score(doc) = sum of 1 / (k + rank), rank is 1-indexed.
     k=60 is the standard constant from the 2009 paper.
     """
     scores: dict[str, float] = {}
@@ -227,8 +260,8 @@ def retrieve_chunks_hybrid(
     Full hybrid retrieval pipeline with hierarchical parent resolution.
 
     Step 1 — Vector search on child collection
-        Uses hyde_query for embedding if provided (Phase 5 HyDE),
-        otherwise uses original query. Returns child texts + parent_id metadata.
+        Uses hyde_query for embedding if provided (HyDE),
+        otherwise uses original query.
 
     Step 2 — BM25 keyword search on child chunks
         Always uses original query — keyword search benefits from
@@ -244,42 +277,31 @@ def retrieve_chunks_hybrid(
 
     Returns parent chunks — large, context-rich strings ready for
     the reranker and then the LLM.
-
-    Args:
-        query       — user's original question (used for BM25 + fallback vector)
-        hyde_query  — hypothetical document passage (used for vector if set)
-        top_k       — max number of unique parent chunks to return
     """
     if top_k is None:
         top_k = settings.top_k_results
 
-    # Pull more candidates than top_k — RRF needs a wide pool to work well
     n_candidates = min(top_k * 3, 60)
-
     child_col_name = f"session_{session_id}_child"
 
-    # ── Step 1: Vector search on child collection ─────────────────────────────
+    # ── Step 1: Vector search ─────────────────────────────────────────────────
     vector_children: list[str] = []
-    # Maps child text → its parent_id — built from ChromaDB metadata
     text_to_parent: dict[str, int] = {}
 
-    # For vector embedding: prefer HyDE query if available (Phase 5)
-    # HyDE bridges the phrasing gap between user language and document language
     vector_query = hyde_query if hyde_query else query
 
     try:
         child_col = chroma_client.get_collection(child_col_name)
-        query_embedding = embedding_model.encode([vector_query]).tolist()
+        query_embedding = _embed_query(vector_query)
 
         results = child_col.query(
-            query_embeddings=query_embedding,
+            query_embeddings=[query_embedding],
             n_results=min(n_candidates, child_col.count()),
             include=["documents", "metadatas"],
         )
 
         if results["documents"] and results["documents"][0]:
             vector_children = results["documents"][0]
-            # Build text→parent_id mapping from returned metadata
             for i, doc in enumerate(vector_children):
                 meta = results["metadatas"][0][i]
                 parent_id = meta.get("parent_id")
@@ -289,13 +311,11 @@ def retrieve_chunks_hybrid(
     except Exception as exc:
         logger.warning("Vector search failed for session=%s: %s", session_id, exc)
 
-    # ── Step 2: BM25 keyword search on child chunks ───────────────────────────
+    # ── Step 2: BM25 keyword search ───────────────────────────────────────────
     bm25_children: list[str] = []
 
     if session_id in _bm25_store:
         bm25_index, all_children, child_to_parent_map = _bm25_store[session_id]
-
-        # BM25 always uses original query — exact user words matter here
         tokenized_query = query.lower().split()
         bm25_scores = bm25_index.get_scores(tokenized_query)
 
@@ -334,7 +354,7 @@ def retrieve_chunks_hybrid(
         logger.error("Both vector and BM25 returned empty for session=%s", session_id)
         return []
 
-    # ── Step 4: RRF fusion on child texts ─────────────────────────────────────
+    # ── Step 4: RRF fusion ────────────────────────────────────────────────────
     if not bm25_children:
         top_children = vector_children
     elif not vector_children:
@@ -355,7 +375,6 @@ def retrieve_chunks_hybrid(
     try:
         parent_col = chroma_client.get_collection(f"session_{session_id}_parent")
     except Exception as exc:
-        # Parent collection missing — this shouldn't happen but degrade gracefully
         logger.error(
             "Parent collection not found for session=%s: %s — "
             "returning raw children as fallback",
@@ -376,7 +395,6 @@ def retrieve_chunks_hybrid(
             continue
 
         if parent_id in seen_parent_ids:
-            # Multiple children mapped to same parent — skip duplicate
             continue
 
         seen_parent_ids.add(parent_id)
@@ -406,18 +424,14 @@ def retrieve_chunks_hybrid(
 # ── Session existence check ───────────────────────────────────────────────────
 def session_exists(session_id: str) -> bool:
     """
-    Check for Phase 4 hierarchical collections first.
-    Falls back to legacy flat collection check for pre-Phase 4 sessions.
-    Pre-Phase 4 sessions cannot be retrieved with the new pipeline —
-    they'll need to be re-uploaded to get hierarchical indexes built.
+    Check for hierarchical collections first.
+    Falls back to legacy flat collection check for pre-hierarchical sessions.
     """
     try:
         chroma_client.get_collection(f"session_{session_id}_child")
         return True
     except Exception:
         try:
-            # Backward compat — old flat sessions still "exist" for session checks
-            # but retrieval will fail gracefully for them
             chroma_client.get_collection(f"session_{session_id}")
             return True
         except Exception:
@@ -459,15 +473,12 @@ def process_pdf(
         except Exception:
             pass
 
-    # Return child count so upload response shows meaningful chunk count
     return page_count, len(child_chunks)
 
 
 # ── Background cleanup stub ───────────────────────────────────────────────────
 def delete_old_collections(max_age_seconds: int = 86400):
     """
-    Cleanup stub. Full implementation would delete both _child and _parent
-    collections for expired sessions, and pop from _bm25_store.
-    Render free tier wipes everything on redeploy anyway.
+    Cleanup stub. Render free tier wipes everything on redeploy anyway.
     """
     pass

@@ -1,31 +1,16 @@
-# Web framework
 fastapi==0.111.0
 uvicorn[standard]==0.29.0
-
-# RAG stack
 pypdf==4.2.0
 chromadb==0.5.0
-sentence-transformers==3.0.0
-langchain==0.2.0
-langchain-community==0.2.0
+langchain-text-splitters==0.2.0
 rank-bm25==0.2.2
-cohere>=5.0.0
-
-# Groq LLM
+cohere>=4.0.0,<5.0.0
 groq==0.9.0
-
-# Google Sheets
 gspread==6.1.2
 google-auth==2.29.0
-
-# Validation + utilities
 python-multipart==0.0.9
 pydantic==2.7.1
 pydantic-settings==2.2.1
 python-dotenv==1.0.1
-
-# Security / rate limiting
 slowapi==0.1.9
-
-# Background cleanup jobs
 apscheduler==3.10.4
