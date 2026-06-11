@@ -1,0 +1,1536 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>RAGbot — Document Intelligence</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,300;0,400;0,600;1,300;1,400;1,600&family=DM+Mono:wght@300;400;500&family=Syne:wght@400;500;600;700&display=swap" rel="stylesheet" />
+
+<style>
+/* ── Reset ───────────────────────────────────────────────────────────────── */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+/* ══════════════════════════════════════════════════════
+   DESIGN AUDIT — what was broken and why:
+
+   1. #gl-canvas opacity: 0.55 — shader was overpowering
+      all text. Gold flame bled through every surface,
+      destroying contrast. Fixed → 0.10 (atmospheric).
+
+   2. --text-muted: #3d3a30 — near-black on near-black.
+      "Sources appear after your first query" was invisible.
+      Fixed → #5e5548.
+
+   3. --text-dim: #7a7260 — too dark for labels.
+      Fixed → #9c9080.
+
+   4. Bot bubble: rgba(255,255,255,0.03) — literally
+      transparent. No visual separation between messages.
+      Fixed → solid surface var(--surface-card).
+
+   5. Source chunks: rgba(255,255,255,0.02) background,
+      10px mono font. Unreadable. Fixed with real card
+      surfaces and 11px.
+
+   6. All labels at 9px. Fixed → 10–11px minimum.
+
+   7. Upload icon was ⬡ (random hexagon glyph).
+      Replaced with a proper upload SVG.
+
+   8. Buttons: transparent on a shifting gold background
+      = zero affordance. Fixed → solid ink-4 surface.
+
+   9. Sidebar had no distinct background — it merged
+      visually with the chat area. Fixed → var(--surface-sidebar).
+══════════════════════════════════════════════════════ */
+
+:root {
+  /* Gold — same hues, used with purpose */
+  --gold:          #c9a84c;
+  --gold-light:    #dfc070;
+  --gold-dim:      #8a6a32;
+  --gold-faint:    rgba(201,168,76,0.08);
+
+  /* Background layers — explicit depth hierarchy */
+  --bg-base:       #0b0a08;   /* page floor */
+  --surface-sidebar: #0f0e0b; /* sidebar panel */
+  --surface-card:  #171510;   /* card surfaces */
+  --surface-hover: #1e1c17;   /* hover state */
+  --surface-input: #141210;   /* inputs */
+
+  /* Text — three distinct, readable levels */
+  --text-primary:  #eee5cc;   /* was #d4c9aa — brighter, more contrast */
+  --text-secondary:#9c9080;   /* was #7a7260 — now actually visible as dim */
+  --text-muted:    #5e5548;   /* was #3d3a30 — was BLACK on black, fixed */
+
+  /* Borders */
+  --border:        rgba(201,168,76,0.12);
+  --border-mid:    rgba(201,168,76,0.25);
+  --border-strong: rgba(201,168,76,0.42);
+
+  /* Semantic */
+  --danger:        #c04535;
+  --success:       #4d9e6a;
+
+  /* Type */
+  --mono:   'DM Mono', monospace;
+  --serif:  'Cormorant Garamond', serif;
+  --sans:   'Syne', sans-serif;
+}
+
+html { scroll-behavior: smooth; }
+
+body {
+  background: var(--bg-base);
+  color: var(--text-primary);
+  font-family: var(--sans);
+  font-size: 14px;
+  line-height: 1.65;
+  cursor: none;
+  overflow-x: hidden;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ── Custom cursor ───────────────────────────────────────────────────────── */
+#cursor-dot, #cursor-ring {
+  position: fixed;
+  pointer-events: none;
+  z-index: 9999;
+  border-radius: 50%;
+  transform: translate(-50%, -50%);
+}
+#cursor-dot {
+  width: 4px; height: 4px;
+  background: var(--gold);
+}
+#cursor-ring {
+  width: 26px; height: 26px;
+  border: 1px solid rgba(201,168,76,0.5);
+  transition: width 0.22s, height 0.22s, border-color 0.22s;
+}
+body.cursor-hover #cursor-ring {
+  width: 42px; height: 42px;
+  border-color: var(--gold-light);
+}
+body.cursor-active #cursor-ring {
+  width: 16px; height: 16px;
+}
+
+/* ── WebGL canvas ────────────────────────────────────────────────────────── */
+/* FIX #1 — opacity was 0.55, making the shader dominate everything.
+   At 0.10 it becomes a subtle atmospheric texture, not a wildfire. */
+#gl-canvas {
+  position: fixed;
+  inset: 0;
+  width: 100%; height: 100%;
+  z-index: 0;
+  opacity: 0.10;
+}
+
+/* ── Grain ───────────────────────────────────────────────────────────────── */
+.grain {
+  position: fixed;
+  inset: 0;
+  z-index: 1;
+  pointer-events: none;
+  opacity: 0.06;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noise'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noise)'/%3E%3C/svg%3E");
+  background-size: 256px 256px;
+}
+
+/* ── App shell ───────────────────────────────────────────────────────────── */
+#app {
+  position: relative;
+  z-index: 2;
+  min-height: 100vh;
+  display: grid;
+  grid-template-rows: auto 1fr;
+  max-width: 1140px;
+  margin: 0 auto;
+  padding: 0 24px;
+}
+
+/* ── Header ──────────────────────────────────────────────────────────────── */
+header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 1px solid var(--border);
+  padding: 18px 0;
+  gap: 16px;
+}
+
+.logo {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+}
+.logo-mark {
+  font-family: var(--serif);
+  font-size: 24px;
+  font-style: italic;
+  font-weight: 300;
+  color: var(--gold);
+  letter-spacing: 0.03em;
+  line-height: 1;
+}
+.logo-sub {
+  font-family: var(--mono);
+  font-size: 10px;
+  font-weight: 300;
+  color: var(--text-muted);
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+}
+
+.header-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-secondary);
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+.status-dot {
+  width: 7px; height: 7px;
+  border-radius: 50%;
+  background: var(--text-muted);
+  flex-shrink: 0;
+  transition: background 0.5s, box-shadow 0.5s;
+}
+.status-dot.online {
+  background: var(--success);
+  box-shadow: 0 0 0 3px rgba(77,158,106,0.15), 0 0 8px rgba(77,158,106,0.35);
+}
+.status-dot.offline {
+  background: var(--danger);
+  box-shadow: 0 0 0 3px rgba(192,69,53,0.15), 0 0 8px rgba(192,69,53,0.35);
+}
+
+/* ── Main two-column grid ────────────────────────────────────────────────── */
+main {
+  display: grid;
+  grid-template-columns: 284px 1fr;
+  gap: 0;
+}
+
+/* ── Sidebar ─────────────────────────────────────────────────────────────── */
+/* FIX #9 — sidebar now has a distinct background surface so it reads
+   as a separate panel, not a continuation of the chat area */
+aside {
+  background: var(--surface-sidebar);
+  border-right: 1px solid var(--border);
+  padding: 28px 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 28px;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--surface-hover) transparent;
+}
+
+.sidebar-section-label {
+  font-family: var(--mono);
+  font-size: 10px;   /* FIX #6 — was 9px: invisible in dark UI */
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+  margin-bottom: 14px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.sidebar-section-label::before {
+  content: '';
+  width: 14px;
+  height: 1px;
+  background: var(--gold-dim);
+  flex-shrink: 0;
+}
+
+/* ── Upload zone ─────────────────────────────────────────────────────────── */
+.upload-zone {
+  border: 1px dashed var(--border-strong);
+  background: var(--surface-card);
+  padding: 26px 14px 22px;
+  text-align: center;
+  cursor: pointer;
+  transition: border-color 0.28s, background 0.28s;
+  position: relative;
+  overflow: hidden;
+}
+.upload-zone:hover {
+  border-color: var(--gold);
+  background: rgba(201,168,76,0.05);
+}
+.upload-zone.drag-over {
+  border-style: solid;
+  border-color: var(--gold-light);
+  background: rgba(201,168,76,0.08);
+}
+.upload-zone input[type="file"] {
+  position: absolute;
+  inset: 0;
+  opacity: 0;
+  cursor: pointer;
+}
+
+/* FIX #7 — replaced meaningless ⬡ glyph with a proper upload arrow SVG */
+.upload-icon {
+  width: 42px; height: 42px;
+  border: 1px solid var(--border-mid);
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin: 0 auto 12px;
+  color: var(--gold-dim);
+  transition: border-color 0.28s, color 0.28s;
+}
+.upload-zone:hover .upload-icon {
+  border-color: var(--gold);
+  color: var(--gold);
+}
+.upload-icon svg {
+  width: 18px; height: 18px;
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.upload-text {
+  font-family: var(--serif);
+  font-style: italic;
+  font-size: 15px;
+  color: var(--text-primary);
+  display: block;
+  margin-bottom: 5px;
+}
+.upload-hint {
+  font-family: var(--mono);
+  font-size: 10px;
+  color: var(--text-secondary);  /* FIX — was --text-dim at old invisible value */
+  letter-spacing: 0.09em;
+  line-height: 1.6;
+}
+
+/* ── Progress bar ────────────────────────────────────────────────────────── */
+.progress-wrap {
+  display: none;
+  margin-top: 14px;
+}
+.progress-wrap.visible { display: block; }
+.progress-bar {
+  height: 2px;
+  background: var(--surface-hover);
+  border-radius: 1px;
+  overflow: hidden;
+}
+.progress-fill {
+  height: 100%;
+  background: linear-gradient(90deg, var(--gold-dim), var(--gold), var(--gold-light));
+  width: 0%;
+  transition: width 0.25s ease;
+  animation: shimmer 1.8s infinite;
+}
+@keyframes shimmer {
+  0%,100% { filter: brightness(0.9); }
+  50%      { filter: brightness(1.3); }
+}
+
+/* ── Session info card ───────────────────────────────────────────────────── */
+.session-card {
+  background: var(--surface-card);
+  border: 1px solid var(--border);
+  padding: 14px 16px;
+  font-family: var(--mono);
+  font-size: 11px;    /* FIX #6 — was 10px */
+  color: var(--text-secondary);
+  display: none;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 10px;
+}
+.session-card.visible { display: flex; }
+
+.s-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+}
+.s-row > span:first-child {
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+.s-val {
+  color: var(--text-primary);  /* FIX — data values now visually distinct from labels */
+  font-weight: 400;
+  letter-spacing: 0.05em;
+  text-align: right;
+}
+
+/* ── Source chunks ───────────────────────────────────────────────────────── */
+/* FIX #5 — chunks had rgba(255,255,255,0.02) background (invisible)
+   and 10px font. Now: real surface, 11px, readable. */
+.sources-panel {
+  display: none;
+  flex-direction: column;
+  gap: 6px;
+}
+.sources-panel.visible { display: flex; }
+
+.source-chunk {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-secondary);
+  background: var(--surface-card);
+  border: 1px solid var(--border);
+  border-left: 2px solid var(--gold-dim);
+  padding: 10px 12px;
+  line-height: 1.7;
+  max-height: 70px;
+  overflow: hidden;
+  position: relative;
+  cursor: pointer;
+  transition: max-height 0.35s ease, border-left-color 0.22s, background 0.22s;
+}
+.source-chunk:hover {
+  border-left-color: var(--gold);
+  background: var(--surface-hover);
+}
+.source-chunk.expanded { max-height: 300px; }
+.source-chunk::after {
+  content: '· · ·';
+  position: absolute;
+  bottom: 0; left: 0; right: 0;
+  padding: 5px 0 6px;
+  text-align: center;
+  background: linear-gradient(transparent, var(--surface-card) 55%);
+  font-size: 10px;
+  letter-spacing: 0.3em;
+  color: var(--text-muted);
+}
+.source-chunk:hover::after {
+  background: linear-gradient(transparent, var(--surface-hover) 55%);
+}
+.source-chunk.expanded::after { display: none; }
+
+#sources-empty {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-muted);   /* FIX — was old near-black muted value */
+  letter-spacing: 0.07em;
+  line-height: 1.65;
+}
+
+/* ── Chat panel ──────────────────────────────────────────────────────────── */
+.chat-panel {
+  display: flex;
+  flex-direction: column;
+  height: calc(100vh - 73px);
+  background: var(--bg-base);
+}
+
+/* ── Messages ────────────────────────────────────────────────────────────── */
+.messages {
+  flex: 1;
+  overflow-y: auto;
+  padding: 32px 32px 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 22px;
+  scrollbar-width: thin;
+  scrollbar-color: var(--surface-hover) transparent;
+}
+.messages::-webkit-scrollbar { width: 3px; }
+.messages::-webkit-scrollbar-thumb { background: var(--surface-hover); }
+
+/* ── Empty state ─────────────────────────────────────────────────────────── */
+.empty-state {
+  margin: auto;
+  text-align: center;
+  padding: 48px 24px;
+}
+.empty-state h2 {
+  font-family: var(--serif);
+  font-style: italic;
+  font-weight: 300;
+  font-size: 30px;
+  color: var(--gold);
+  margin-bottom: 10px;
+  opacity: 0.55;
+  letter-spacing: -0.01em;
+}
+.empty-state p {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-muted);
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+}
+
+/* ── Message rows ────────────────────────────────────────────────────────── */
+.msg {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  animation: msg-in 0.26s ease forwards;
+  opacity: 0;
+}
+@keyframes msg-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.msg.user { align-items: flex-end; }
+.msg.bot  { align-items: flex-start; }
+
+.msg-role {
+  font-family: var(--mono);
+  font-size: 10px;   /* FIX — was 9px */
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+  padding: 0 2px;
+}
+
+/* FIX #4 — bubbles had near-zero backgrounds.
+   User: rgba(201,168,76,0.1) — barely perceptible.
+   Bot:  rgba(255,255,255,0.03) — functionally invisible.
+   Both now have real, readable surfaces. */
+.msg-bubble {
+  max-width: 78%;
+  padding: 13px 18px;
+  font-size: 14px;
+  line-height: 1.78;
+  word-break: break-word;
+}
+
+.msg.user .msg-bubble {
+  background: rgba(201,168,76,0.11);
+  border: 1px solid rgba(201,168,76,0.26);
+  border-bottom-right-radius: 0;
+  font-family: var(--sans);
+  color: var(--text-primary);
+}
+
+.msg.bot .msg-bubble {
+  /* FIX — solid surface instead of rgba(255,255,255,0.03) */
+  background: var(--surface-card);
+  border: 1px solid var(--border);
+  border-left: 2px solid var(--gold-dim);
+  border-bottom-left-radius: 0;
+  font-family: var(--serif);
+  font-size: 15px;
+  color: var(--text-primary);
+}
+
+/* ── Typing indicator ────────────────────────────────────────────────────── */
+.typing-bubble {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  padding: 14px 18px;
+}
+.typing-dot {
+  width: 5px; height: 5px;
+  border-radius: 50%;
+  background: var(--gold-dim);
+  animation: bounce 1.3s ease-in-out infinite;
+}
+.typing-dot:nth-child(2) { animation-delay: 0.18s; }
+.typing-dot:nth-child(3) { animation-delay: 0.36s; }
+@keyframes bounce {
+  0%,80%,100% { transform: translateY(0); opacity: 0.45; }
+  40%          { transform: translateY(-7px); opacity: 1; }
+}
+
+/* ── Lead capture card ───────────────────────────────────────────────────── */
+.lead-card {
+  background: var(--surface-card);
+  border: 1px solid var(--border-mid);
+  border-left: 2px solid var(--gold);
+  padding: 20px 22px;
+  max-width: 380px;
+  display: none;
+  animation: msg-in 0.35s ease forwards;
+  opacity: 0;
+}
+.lead-card.visible { display: block; }
+
+.lead-card h3 {
+  font-family: var(--serif);
+  font-style: italic;
+  font-weight: 300;
+  font-size: 19px;
+  color: var(--gold);
+  margin-bottom: 6px;
+  line-height: 1.2;
+}
+.lead-card p {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-secondary);
+  letter-spacing: 0.06em;
+  margin-bottom: 18px;
+  line-height: 1.65;
+}
+
+.lead-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.lead-fields input {
+  background: var(--surface-input);
+  border: 1px solid var(--border-mid);
+  color: var(--text-primary);
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 11px 14px;
+  outline: none;
+  transition: border-color 0.22s, background 0.22s;
+  width: 100%;
+  letter-spacing: 0.04em;
+}
+.lead-fields input:focus {
+  border-color: var(--gold);
+  background: var(--surface-hover);
+}
+.lead-fields input::placeholder { color: var(--text-muted); }
+
+/* ── Buttons ─────────────────────────────────────────────────────────────── */
+/* FIX #8 — was transparent border on moving gold background = no affordance.
+   Now: solid surface with clear hover transition. */
+.btn {
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  border: 1px solid var(--border-mid);
+  background: var(--surface-hover);
+  color: var(--text-secondary);
+  padding: 10px 18px;
+  cursor: pointer;
+  transition: background 0.2s, color 0.2s, border-color 0.2s;
+}
+.btn:hover {
+  background: var(--surface-card);
+  color: var(--gold-light);
+  border-color: var(--gold);
+}
+.btn:disabled {
+  opacity: 0.38;
+  cursor: not-allowed;
+}
+
+.btn-primary {
+  background: rgba(201,168,76,0.12);
+  border-color: var(--border-strong);
+  color: var(--gold);
+}
+.btn-primary:hover {
+  background: rgba(201,168,76,0.2);
+  border-color: var(--gold);
+  color: var(--gold-light);
+}
+
+.btn-sm { padding: 7px 13px; font-size: 10px; }
+
+/* ── Input bar ───────────────────────────────────────────────────────────── */
+/* FIX — input area now has a distinct elevated background that clearly
+   separates it from the message list above */
+.input-bar {
+  border-top: 1px solid var(--border);
+  background: var(--surface-sidebar);
+  padding: 14px 24px 16px;
+  display: flex;
+  gap: 12px;
+  align-items: flex-end;
+}
+
+#chat-input {
+  flex: 1;
+  background: var(--surface-card);
+  border: 1px solid var(--border-mid);
+  color: var(--text-primary);
+  font-family: var(--serif);
+  font-size: 15px;
+  padding: 11px 16px;
+  outline: none;
+  resize: none;
+  min-height: 46px;
+  max-height: 120px;
+  line-height: 1.55;
+  transition: border-color 0.22s, background 0.22s;
+  letter-spacing: 0.01em;
+}
+#chat-input:focus {
+  border-color: var(--gold);
+  background: var(--surface-hover);
+}
+#chat-input::placeholder {
+  color: var(--text-muted);
+  font-style: italic;
+}
+#chat-input:disabled { opacity: 0.4; cursor: not-allowed; }
+
+/* Send button — make it actually look like a button */
+#send-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 46px;
+  padding: 10px 20px;
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+#send-btn svg {
+  width: 13px; height: 13px;
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  flex-shrink: 0;
+}
+
+/* ── Divider ─────────────────────────────────────────────────────────────── */
+.divider {
+  height: 1px;
+  background: var(--border);
+  margin: 4px 0;
+}
+
+/* ── Toasts ──────────────────────────────────────────────────────────────── */
+#toast-container {
+  position: fixed;
+  bottom: 24px; right: 24px;
+  z-index: 999;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-width: 320px;
+}
+.toast {
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 12px 16px;
+  background: var(--surface-card);
+  color: var(--text-primary);
+  letter-spacing: 0.05em;
+  line-height: 1.55;
+  border: 1px solid var(--border);
+  animation: toast-in 0.26s ease, toast-out 0.26s ease 3.7s forwards;
+}
+.toast::before {
+  display: block;
+  font-size: 9px;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  margin-bottom: 3px;
+  opacity: 0.6;
+}
+.toast.success { border-left: 2px solid var(--success); }
+.toast.success::before { content: 'Success'; color: var(--success); }
+.toast.error   { border-left: 2px solid var(--danger); }
+.toast.error::before   { content: 'Error'; color: var(--danger); }
+.toast.info    { border-left: 2px solid var(--gold-dim); }
+.toast.info::before    { content: 'Info'; color: var(--gold); }
+
+@keyframes toast-in {
+  from { opacity: 0; transform: translateX(14px); }
+  to   { opacity: 1; transform: translateX(0); }
+}
+@keyframes toast-out {
+  from { opacity: 1; }
+  to   { opacity: 0; }
+}
+
+/* ── Utility ─────────────────────────────────────────────────────────────── */
+.hidden { display: none !important; }
+
+/* ── Responsive ──────────────────────────────────────────────────────────── */
+@media (max-width: 768px) {
+  main { grid-template-columns: 1fr; }
+  aside {
+    border-right: none;
+    border-bottom: 1px solid var(--border);
+    padding: 18px 16px;
+    max-height: 260px;
+    overflow-y: auto;
+  }
+  .chat-panel { height: calc(100vh - 330px); min-height: 300px; }
+  .messages { padding: 20px 16px; }
+  .input-bar { padding: 12px 16px; }
+  body { cursor: auto; }
+  #cursor-dot, #cursor-ring { display: none; }
+}
+</style>
+</head>
+<body>
+
+<!-- Custom cursor -->
+<div id="cursor-dot"></div>
+<div id="cursor-ring"></div>
+
+<!-- WebGL background (shader opacity fixed in CSS: 0.55 → 0.10) -->
+<canvas id="gl-canvas"></canvas>
+<div class="grain"></div>
+
+<!-- Toast container -->
+<div id="toast-container"></div>
+
+<div id="app">
+
+  <header>
+    <div class="logo">
+      <span class="logo-mark">RAGbot</span>
+      <span class="logo-sub">Document Intelligence</span>
+    </div>
+    <div class="header-status">
+      <div id="status-dot" class="status-dot"></div>
+      <span id="status-label">Connecting…</span>
+    </div>
+  </header>
+
+  <main>
+
+    <!-- ── Sidebar ──────────────────────────────────────────────────────── -->
+    <aside>
+
+      <div>
+        <div class="sidebar-section-label">Document</div>
+
+        <div class="upload-zone" id="upload-zone">
+          <input type="file" id="file-input" accept=".pdf" />
+          <!-- Fixed: proper upload SVG instead of ⬡ hexagon glyph -->
+          <div class="upload-icon">
+            <svg viewBox="0 0 24 24">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+              <polyline points="17 8 12 3 7 8"/>
+              <line x1="12" y1="3" x2="12" y2="15"/>
+            </svg>
+          </div>
+          <span class="upload-text">Drop PDF here</span>
+          <span class="upload-hint">or click to browse · max 10 MB</span>
+          <div class="progress-wrap" id="progress-wrap">
+            <div class="progress-bar">
+              <div class="progress-fill" id="progress-fill"></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="session-card" id="session-card">
+          <div class="s-row">
+            <span>Session</span>
+            <span class="s-val" id="sc-id">—</span>
+          </div>
+          <div class="s-row">
+            <span>Pages</span>
+            <span class="s-val" id="sc-pages">—</span>
+          </div>
+          <div class="s-row">
+            <span>Chunks</span>
+            <span class="s-val" id="sc-chunks">—</span>
+          </div>
+          <div class="divider"></div>
+          <button class="btn btn-sm" id="new-session-btn">New Session</button>
+        </div>
+      </div>
+
+      <div>
+        <div class="sidebar-section-label">Retrieved Sources</div>
+        <div class="sources-panel" id="sources-panel"></div>
+        <div id="sources-empty" style="font-family:var(--mono);font-size:11px;color:var(--text-muted);letter-spacing:0.07em;line-height:1.65;">
+          Sources appear after your first query.
+        </div>
+      </div>
+
+    </aside>
+
+    <!-- ── Chat panel ────────────────────────────────────────────────────── -->
+    <div class="chat-panel">
+      <div class="messages" id="messages">
+        <div class="empty-state" id="empty-state">
+          <h2>Ask your document</h2>
+          <p>Upload a PDF to begin the conversation</p>
+        </div>
+      </div>
+
+      <div class="input-bar">
+        <textarea
+          id="chat-input"
+          placeholder="Ask a question about your document…"
+          rows="1"
+          disabled
+        ></textarea>
+        <button class="btn btn-primary" id="send-btn" disabled>
+          <svg viewBox="0 0 24 24">
+            <line x1="22" y1="2" x2="11" y2="13"/>
+            <polygon points="22 2 15 22 11 13 2 9 22 2"/>
+          </svg>
+          Send
+        </button>
+      </div>
+    </div>
+
+  </main>
+</div>
+
+
+<script>
+/* ═══════════════════════════════════════════════════════════════════════════
+   CONFIG
+═══════════════════════════════════════════════════════════════════════════ */
+const API_BASE = "https://ragbot-v1.onrender.com"; // ← Change to your Render URL
+const API_KEY  = '';                      // ← Set if you added RAGBOT_API_KEY to .env
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   WEBGL SHADER — Fractal Brownian Motion Gold Flame
+═══════════════════════════════════════════════════════════════════════════ */
+(function initWebGL() {
+  const canvas = document.getElementById('gl-canvas');
+  const gl = canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
+  if (!gl) { canvas.style.display = 'none'; return; }
+
+  const vert = `
+    attribute vec2 a_pos;
+    void main() { gl_Position = vec4(a_pos, 0.0, 1.0); }
+  `;
+
+  const frag = `
+    precision mediump float;
+    uniform float u_time;
+    uniform vec2  u_res;
+
+    float hash(vec2 p) {
+      return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453);
+    }
+    float noise(vec2 p) {
+      vec2 i = floor(p), f = fract(p);
+      f = f*f*(3.0-2.0*f);
+      return mix(
+        mix(hash(i), hash(i+vec2(1,0)), f.x),
+        mix(hash(i+vec2(0,1)), hash(i+vec2(1,1)), f.x),
+        f.y
+      );
+    }
+    float fbm(vec2 p) {
+      float v=0.0, a=0.5;
+      for(int i=0;i<5;i++){
+        v += a * noise(p);
+        p  = p * 2.1 + vec2(1.7, 9.2);
+        a *= 0.5;
+      }
+      return v;
+    }
+
+    void main() {
+      vec2 uv = gl_FragCoord.xy / u_res;
+      uv.y = 1.0 - uv.y;
+
+      float t = u_time * 0.07;
+      vec2 q = vec2(fbm(uv + t), fbm(uv + vec2(1.0, t)));
+      vec2 r = vec2(fbm(uv + 3.5*q + vec2(1.7, 9.2) + 0.15*t),
+                    fbm(uv + 3.5*q + vec2(8.3, 2.8) + 0.126*t));
+      float f = fbm(uv + 3.9*r);
+
+      // Gold palette
+      vec3 col = mix(
+        vec3(0.08, 0.06, 0.02),
+        mix(vec3(0.55, 0.38, 0.10), vec3(0.78, 0.60, 0.20), clamp(f*2.0,0.0,1.0)),
+        clamp(f*f*4.0, 0.0, 1.0)
+      );
+      col = mix(col, vec3(0.9, 0.78, 0.45), clamp(f*f*f*f*2.5, 0.0, 1.0));
+
+      // Vignette
+      vec2 vig = uv * (1.0 - uv.yx);
+      col *= pow(vig.x * vig.y * 16.0, 0.25);
+
+      gl_FragColor = vec4(col, 1.0);
+    }
+  `;
+
+  function compile(type, src) {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src);
+    gl.compileShader(s);
+    return s;
+  }
+
+  const prog = gl.createProgram();
+  gl.attachShader(prog, compile(gl.VERTEX_SHADER, vert));
+  gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, frag));
+  gl.linkProgram(prog);
+  gl.useProgram(prog);
+
+  const buf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1,1,-1,-1,1,1,1]), gl.STATIC_DRAW);
+
+  const pos = gl.getAttribLocation(prog, 'a_pos');
+  gl.enableVertexAttribArray(pos);
+  gl.vertexAttribPointer(pos, 2, gl.FLOAT, false, 0, 0);
+
+  const uTime = gl.getUniformLocation(prog, 'u_time');
+  const uRes  = gl.getUniformLocation(prog, 'u_res');
+
+  function resize() {
+    canvas.width  = window.innerWidth;
+    canvas.height = window.innerHeight;
+    gl.viewport(0, 0, canvas.width, canvas.height);
+  }
+  resize();
+  window.addEventListener('resize', resize);
+
+  let t0 = performance.now();
+  (function loop(now) {
+    gl.uniform1f(uTime, (now - t0) / 1000);
+    gl.uniform2f(uRes, canvas.width, canvas.height);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+    requestAnimationFrame(loop);
+  })(t0);
+})();
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   CUSTOM CURSOR
+═══════════════════════════════════════════════════════════════════════════ */
+(function initCursor() {
+  const dot  = document.getElementById('cursor-dot');
+  const ring = document.getElementById('cursor-ring');
+  let rx = 0, ry = 0, mx = 0, my = 0;
+
+  document.addEventListener('mousemove', e => { mx = e.clientX; my = e.clientY; });
+  document.addEventListener('mousedown', () => document.body.classList.add('cursor-active'));
+  document.addEventListener('mouseup',   () => document.body.classList.remove('cursor-active'));
+
+  document.querySelectorAll('button, a, .upload-zone, .source-chunk, textarea, input')
+    .forEach(el => {
+      el.addEventListener('mouseenter', () => document.body.classList.add('cursor-hover'));
+      el.addEventListener('mouseleave', () => document.body.classList.remove('cursor-hover'));
+    });
+
+  (function loop() {
+    dot.style.left  = mx + 'px';
+    dot.style.top   = my + 'px';
+    rx += (mx - rx) * 0.12;
+    ry += (my - ry) * 0.12;
+    ring.style.left = rx + 'px';
+    ring.style.top  = ry + 'px';
+    requestAnimationFrame(loop);
+  })();
+})();
+
+/* ═══════════════════════════════════════════════════════════════════════════
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   APP STATE
+═══════════════════════════════════════════════════════════════════════════ */
+const state = {
+  sessionId:    null,
+  pageCount:    0,
+  chunkCount:   0,
+  isLoading:    false,
+  leadShown:    false,
+  lastQuery:    '',
+};
+
+// FIX 8: Also persist conversation messages so they survive page refresh
+function saveSession() {
+  if (!state.sessionId) return;
+  localStorage.setItem('ragbot_session', JSON.stringify({
+    sessionId:  state.sessionId,
+    pageCount:  state.pageCount,
+    chunkCount: state.chunkCount,
+  }));
+}
+function saveMessages() {
+  // Store up to 40 serialised messages (text only — no DOM references)
+  const msgs = [];
+  document.querySelectorAll('#messages .msg[data-role]').forEach(el => {
+    msgs.push({ role: el.dataset.role, text: el.querySelector('.msg-bubble').textContent });
+  });
+  localStorage.setItem('ragbot_messages', JSON.stringify(msgs.slice(-40)));
+}
+function clearSession() {
+  localStorage.removeItem('ragbot_session');
+  localStorage.removeItem('ragbot_messages');
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   ELEMENT REFS
+═══════════════════════════════════════════════════════════════════════════ */
+const $messages     = document.getElementById('messages');
+const $emptyState   = document.getElementById('empty-state');
+const $chatInput    = document.getElementById('chat-input');
+const $sendBtn      = document.getElementById('send-btn');
+const $fileInput    = document.getElementById('file-input');
+const $uploadZone   = document.getElementById('upload-zone');
+const $progressWrap = document.getElementById('progress-wrap');
+const $progressFill = document.getElementById('progress-fill');
+const $sessionCard  = document.getElementById('session-card');
+const $scId         = document.getElementById('sc-id');
+const $scPages      = document.getElementById('sc-pages');
+const $scChunks     = document.getElementById('sc-chunks');
+const $sourcesPanel = document.getElementById('sources-panel');
+const $sourcesEmpty = document.getElementById('sources-empty');
+const $newSessionBtn= document.getElementById('new-session-btn');
+const $statusDot    = document.getElementById('status-dot');
+const $statusLabel  = document.getElementById('status-label');
+
+/* Progress label element — injected once into the progress wrap */
+const $progressLabel = (() => {
+  const el = document.createElement('div');
+  el.style.cssText = 'font-family:var(--mono);font-size:10px;color:var(--text-secondary);letter-spacing:.1em;margin-top:6px;text-align:center;';
+  $progressWrap.appendChild(el);
+  return el;
+})();
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   TOAST
+═══════════════════════════════════════════════════════════════════════════ */
+function toast(msg, type = 'info') {
+  const el = document.createElement('div');
+  el.className = `toast ${type}`;
+  el.textContent = msg;
+  document.getElementById('toast-container').appendChild(el);
+  setTimeout(() => el.remove(), 4200);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   HEALTH POLLING
+═══════════════════════════════════════════════════════════════════════════ */
+async function checkHealth() {
+  try {
+    const r = await fetch(`${API_BASE}/health`, { signal: AbortSignal.timeout(4000) });
+    if (r.ok) {
+      $statusDot.className = 'status-dot online';
+      $statusLabel.textContent = 'Online';
+    } else throw new Error();
+  } catch {
+    $statusDot.className = 'status-dot offline';
+    $statusLabel.textContent = 'Offline';
+  }
+}
+checkHealth();
+setInterval(checkHealth, 30000);
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   SESSION RESTORE  (FIX 8 — also restores conversation messages)
+═══════════════════════════════════════════════════════════════════════════ */
+async function tryRestoreSession() {
+  const saved = localStorage.getItem('ragbot_session');
+  if (!saved) return;
+  try {
+    const { sessionId, pageCount, chunkCount } = JSON.parse(saved);
+    const r = await fetch(`${API_BASE}/session/${sessionId}`, {
+      headers: API_KEY ? { 'X-API-Key': API_KEY } : {},
+    });
+    const data = await r.json();
+    if (data.valid) {
+      state.sessionId  = sessionId;
+      state.pageCount  = pageCount;
+      state.chunkCount = chunkCount;
+      updateSessionUI();
+      enableChat();
+
+      // FIX 8: Re-render persisted messages so the window isn't empty
+      const savedMsgs = localStorage.getItem('ragbot_messages');
+      if (savedMsgs) {
+        JSON.parse(savedMsgs).forEach(m => appendMessage(m.role, m.text, /*save=*/false));
+      }
+      toast('Previous session restored', 'info');
+    } else {
+      clearSession();
+    }
+  } catch {
+    clearSession();
+  }
+}
+tryRestoreSession();
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   SESSION UI
+═══════════════════════════════════════════════════════════════════════════ */
+function updateSessionUI() {
+  $scId.textContent     = state.sessionId.slice(0, 8) + '…';
+  $scPages.textContent  = state.pageCount;
+  $scChunks.textContent = state.chunkCount;
+  $sessionCard.classList.add('visible');
+}
+
+function enableChat() {
+  $chatInput.disabled = false;
+  $sendBtn.disabled   = false;
+  $chatInput.placeholder = 'Ask a question about your document…';
+  $emptyState.style.display = 'none';
+}
+
+$newSessionBtn.addEventListener('click', () => {
+  state.sessionId  = null;
+  state.pageCount  = 0;
+  state.chunkCount = 0;
+  state.leadShown  = false;
+  clearSession();
+  $sessionCard.classList.remove('visible');
+  $chatInput.disabled = true;
+  $sendBtn.disabled   = true;
+  $chatInput.placeholder = 'Upload a PDF to begin…';
+  $messages.innerHTML = '';
+  $messages.appendChild($emptyState);
+  $emptyState.style.display = '';
+  $sourcesPanel.classList.remove('visible');
+  $sourcesEmpty.style.display = '';
+  $progressWrap.classList.remove('visible');
+  toast('Session cleared — upload a new PDF', 'info');
+});
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   FILE UPLOAD
+   FIX 6:  Warn user before replacing an active session (second PDF)
+   FIX 11: Rate limit guard in the browser (persisted in localStorage so it
+           survives Render cold starts — no reliance on server-side counters)
+   FIX 12: Real SSE progress labels instead of fake animated bar
+═══════════════════════════════════════════════════════════════════════════ */
+
+// FIX 11: Client-side rate limit — max 10 uploads per 60 s
+// Stored in localStorage so cold-start restarts don't reset it.
+const UPLOAD_RATE = { max: 10, windowMs: 60_000 };
+function _checkUploadRateLimit() {
+  const now = Date.now();
+  let log = JSON.parse(localStorage.getItem('ragbot_upload_log') || '[]');
+  log = log.filter(ts => now - ts < UPLOAD_RATE.windowMs);
+  if (log.length >= UPLOAD_RATE.max) {
+    const retryAfter = Math.ceil((UPLOAD_RATE.windowMs - (now - log[0])) / 1000);
+    throw new Error(`Too many uploads — please wait ${retryAfter}s and try again.`);
+  }
+  log.push(now);
+  localStorage.setItem('ragbot_upload_log', JSON.stringify(log));
+}
+
+const PROGRESS_LABELS = {
+  reading:    'Reading file…',
+  validating: 'Validating PDF…',
+  chunking:   'Splitting into chunks…',
+  embedding:  'Generating embeddings…',
+  done:       'Complete',
+  error:      'Processing failed',
+};
+
+$uploadZone.addEventListener('dragover', e => { e.preventDefault(); $uploadZone.classList.add('drag-over'); });
+$uploadZone.addEventListener('dragleave', () => $uploadZone.classList.remove('drag-over'));
+$uploadZone.addEventListener('drop', e => {
+  e.preventDefault();
+  $uploadZone.classList.remove('drag-over');
+  const file = e.dataTransfer.files[0];
+  if (file) uploadPDF(file);
+});
+$fileInput.addEventListener('change', () => {
+  if ($fileInput.files[0]) uploadPDF($fileInput.files[0]);
+});
+
+async function uploadPDF(file) {
+  if (file.type !== 'application/pdf') {
+    toast('Only PDF files are accepted', 'error'); return;
+  }
+  if (file.size > 10 * 1024 * 1024) {
+    toast('File exceeds 10 MB limit', 'error'); return;
+  }
+
+  // FIX 11: Client-side rate limit check
+  try { _checkUploadRateLimit(); }
+  catch (e) { toast(e.message, 'error'); return; }
+
+  // FIX 6: Warn before clobbering an active session
+  if (state.sessionId) {
+    const confirmed = confirm(
+      'You already have a document loaded.\n\n' +
+      'Uploading a new PDF will replace it and clear the current conversation.\n\n' +
+      'Continue?'
+    );
+    if (!confirmed) {
+      $fileInput.value = '';
+      return;
+    }
+    // Reset state so the old session is cleanly replaced
+    state.leadShown = false;
+    clearSession();
+  }
+
+  // FIX 12: Real progress via SSE
+  const progressToken = crypto.randomUUID();
+  let evtSource = null;
+
+  $progressWrap.classList.add('visible');
+  $progressFill.style.width = '0%';
+  $progressLabel.textContent = 'Uploading…';
+
+  // Open SSE channel first, then POST the file
+  try {
+    evtSource = new EventSource(`${API_BASE}/upload/progress/${progressToken}`);
+    evtSource.onmessage = (e) => {
+      try {
+        const { stage, pct, detail } = JSON.parse(e.data);
+        $progressFill.style.width = pct + '%';
+        $progressLabel.textContent = PROGRESS_LABELS[stage] || stage;
+        if (stage === 'error') toast(detail || 'Processing failed', 'error');
+      } catch {}
+    };
+  } catch {
+    // SSE not supported — fall back to fake bar
+    evtSource = null;
+    let pct = 0;
+    const ticker = setInterval(() => {
+      pct = Math.min(pct + Math.random() * 10, 85);
+      $progressFill.style.width = pct + '%';
+    }, 250);
+    evtSource = { close: () => clearInterval(ticker) };
+  }
+
+  const fd = new FormData();
+  fd.append('file', file);
+
+  const headers = API_KEY ? { 'X-API-Key': API_KEY } : {};
+
+  try {
+    const r = await fetch(
+      `${API_BASE}/upload/streamed?progress_token=${progressToken}`,
+      { method: 'POST', body: fd, headers }
+    );
+    evtSource?.close();
+
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({ detail: 'Upload failed' }));
+      throw new Error(err.detail || 'Upload failed');
+    }
+    const data = await r.json();
+
+    $progressFill.style.width = '100%';
+    $progressLabel.textContent = 'Complete';
+
+    state.sessionId  = data.session_id;
+    state.pageCount  = data.pages_processed;
+    state.chunkCount = data.message.match(/(\d+) searchable/)?.[1] || '?';
+    saveSession();
+
+    // FIX 8: Clear stored messages for new session
+    localStorage.removeItem('ragbot_messages');
+    $messages.querySelectorAll('.msg[data-role]').forEach(el => el.remove());
+    $emptyState.style.display = 'none';
+
+    updateSessionUI();
+    enableChat();
+
+    setTimeout(() => {
+      $progressWrap.classList.remove('visible');
+      $progressLabel.textContent = '';
+    }, 800);
+    toast(`✓ ${data.pages_processed} pages indexed successfully`, 'success');
+    $fileInput.value = '';
+  } catch (err) {
+    evtSource?.close();
+    $progressFill.style.width = '0%';
+    $progressLabel.textContent = '';
+    setTimeout(() => $progressWrap.classList.remove('visible'), 400);
+    toast(err.message, 'error');
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   MESSAGING
+═══════════════════════════════════════════════════════════════════════════ */
+// FIX 8: appendMessage accepts a `save` flag; set false when replaying from storage
+function appendMessage(role, text, save = true) {
+  const wrap = document.createElement('div');
+  wrap.className = `msg ${role}`;
+  wrap.dataset.role = role;   // needed for saveMessages() serialisation
+
+  const roleEl = document.createElement('div');
+  roleEl.className = 'msg-role';
+  roleEl.textContent = role === 'user' ? 'You' : 'Assistant';
+
+  const bubble = document.createElement('div');
+  bubble.className = 'msg-bubble';
+  bubble.textContent = text;
+
+  wrap.appendChild(roleEl);
+  wrap.appendChild(bubble);
+  $messages.appendChild(wrap);
+  $messages.scrollTop = $messages.scrollHeight;
+
+  if (save) saveMessages();
+  return wrap;
+}
+
+function showTyping() {
+  const wrap = document.createElement('div');
+  wrap.className = 'msg bot';
+  wrap.id = 'typing-indicator';
+  const bubble = document.createElement('div');
+  bubble.className = 'msg-bubble typing-bubble';
+  bubble.innerHTML = '<div class="typing-dot"></div><div class="typing-dot"></div><div class="typing-dot"></div>';
+  wrap.appendChild(bubble);
+  $messages.appendChild(wrap);
+  $messages.scrollTop = $messages.scrollHeight;
+}
+
+function removeTyping() {
+  document.getElementById('typing-indicator')?.remove();
+}
+
+function updateSources(chunks) {
+  $sourcesPanel.innerHTML = '';
+  if (!chunks || !chunks.length) {
+    $sourcesPanel.classList.remove('visible');
+    $sourcesEmpty.style.display = '';
+    return;
+  }
+  $sourcesEmpty.style.display = 'none';
+  $sourcesPanel.classList.add('visible');
+  chunks.forEach(chunk => {
+    const el = document.createElement('div');
+    el.className = 'source-chunk';
+    el.textContent = chunk;
+    el.title = 'Click to expand';
+    el.addEventListener('click', () => el.classList.toggle('expanded'));
+    $sourcesPanel.appendChild(el);
+  });
+}
+
+/* ─── Lead capture card ─────────────────────────────────────────────────── */
+function showLeadCard(lastQuery) {
+  if (state.leadShown) return;
+  state.leadShown = true;
+
+  const wrap = document.createElement('div');
+  wrap.className = 'msg bot';
+
+  const card = document.createElement('div');
+  card.className = 'lead-card visible';
+  card.innerHTML = `
+    <h3>Connect with us</h3>
+    <p>Looks like you need more detail — let a specialist follow up.</p>
+    <div class="lead-fields">
+      <input type="text"  id="lead-name"  placeholder="Your name" maxlength="100" />
+      <input type="tel"   id="lead-phone" placeholder="Phone number" maxlength="20" />
+      <button class="btn btn-primary" id="lead-submit">Request callback</button>
+      <button class="btn btn-sm" id="lead-dismiss">No thanks</button>
+    </div>
+  `;
+
+  wrap.appendChild(card);
+  $messages.appendChild(wrap);
+  $messages.scrollTop = $messages.scrollHeight;
+
+  document.getElementById('lead-submit').addEventListener('click', submitLead);
+  document.getElementById('lead-dismiss').addEventListener('click', () => wrap.remove());
+}
+
+async function submitLead() {
+  const name  = document.getElementById('lead-name')?.value.trim();
+  const phone = document.getElementById('lead-phone')?.value.trim();
+  if (!name || !phone) { toast('Please fill in all fields', 'error'); return; }
+  if (phone.length < 7) { toast('Enter a valid phone number', 'error'); return; }
+
+  const btn = document.getElementById('lead-submit');
+  btn.disabled = true;
+  btn.textContent = 'Submitting…';
+
+  try {
+    const r = await fetch(`${API_BASE}/lead`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...(API_KEY ? { 'X-API-Key': API_KEY } : {}) },
+      body: JSON.stringify({ name, phone, session_id: state.sessionId, query: state.lastQuery }),
+    });
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.detail || 'Submission failed');
+    toast('✓ We will be in touch shortly', 'success');
+    document.querySelector('.lead-card')?.closest('.msg')?.remove();
+  } catch (err) {
+    btn.disabled = false;
+    btn.textContent = 'Request callback';
+    toast(err.message, 'error');
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   SEND CHAT MESSAGE
+═══════════════════════════════════════════════════════════════════════════ */
+async function sendMessage() {
+  const text = $chatInput.value.trim();
+  if (!text || state.isLoading || !state.sessionId) return;
+
+  state.lastQuery = text;
+  state.isLoading = true;
+  $chatInput.value = '';
+  $chatInput.style.height = 'auto';
+  $sendBtn.disabled = true;
+
+  appendMessage('user', text);
+  showTyping();
+
+  try {
+    const r = await fetch(`${API_BASE}/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...(API_KEY ? { 'X-API-Key': API_KEY } : {}) },
+      body: JSON.stringify({ message: text, session_id: state.sessionId }),
+    });
+
+    removeTyping();
+
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({ detail: 'Request failed' }));
+      if (r.status === 404) {
+        toast('Session expired — please upload your PDF again', 'error');
+        clearSession();
+        $newSessionBtn.click();
+        return;
+      }
+      throw new Error(err.detail || 'Chat request failed');
+    }
+
+    const data = await r.json();
+    appendMessage('bot', data.reply);
+    updateSources(data.source_chunks);
+
+    if (data.lead_triggered) {
+      setTimeout(() => showLeadCard(text), 600);
+    }
+  } catch (err) {
+    removeTyping();
+    appendMessage('bot', `Error: ${err.message}`);
+  } finally {
+    state.isLoading = false;
+    $sendBtn.disabled = false;
+    $chatInput.focus();
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   INPUT HANDLERS
+═══════════════════════════════════════════════════════════════════════════ */
+$chatInput.addEventListener('input', function() {
+  this.style.height = 'auto';
+  this.style.height = Math.min(this.scrollHeight, 120) + 'px';
+});
+
+$chatInput.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    sendMessage();
+  }
+});
+
+$sendBtn.addEventListener('click', sendMessage);
+</script>
+</body>
+</html>
