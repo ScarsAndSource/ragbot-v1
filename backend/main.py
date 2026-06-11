@@ -143,7 +143,24 @@ def _append_lead_to_sheet(lead: LeadCapture) -> bool:
 
 # ─── Email helper ─────────────────────────────────────────────────────────────
 def _send_lead_email(lead: LeadCapture) -> bool:
+    # Skip silently if credentials are missing or still placeholders
+    placeholder_senders = {"yourbot@gmail.com", "", None}
+    placeholder_recipients = {"you@yourdomain.com", "", None}
+    if (
+        settings.email_sender in placeholder_senders
+        or settings.email_recipient in placeholder_recipients
+        or not settings.email_password
+        or settings.email_password.strip() == "xxxx xxxx xxxx xxxx"
+    ):
+        logger.warning("Email skipped — credentials not configured")
+        return False
+
     try:
+        import socket
+
+        old_timeout = socket.getdefaulttimeout()
+        socket.setdefaulttimeout(8)  # never hang more than 8 seconds
+
         msg = MIMEMultipart("alternative")
         msg["Subject"] = f"New Lead — {lead.name}"
         msg["From"] = settings.email_sender
@@ -157,12 +174,16 @@ def _send_lead_email(lead: LeadCapture) -> bool:
           <tr><td><b>Query</b></td><td>{lead.query or "—"}</td></tr>
         </table></body></html>"""
         msg.attach(MIMEText(html_body, "html"))
+
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
             server.login(settings.email_sender, settings.email_password)
             server.sendmail(
                 settings.email_sender, settings.email_recipient, msg.as_string()
             )
+
+        socket.setdefaulttimeout(old_timeout)
         return True
+
     except Exception as exc:
         logger.error("Failed to send lead email: %s", exc)
         return False
