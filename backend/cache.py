@@ -1,6 +1,6 @@
 import logging
 import numpy as np
-from rag import embedding_model
+from rag import _embed_query
 from config import get_settings
 
 settings = get_settings()
@@ -81,8 +81,8 @@ class SemanticCache:
             logger.debug("Cache empty for session=%s — miss", session_id)
             return None
 
-        # Embed the incoming query once
-        query_emb = embedding_model.encode([query])[0]
+        # Embed the incoming query — returns list[float], convert to ndarray
+        query_emb = np.array(_embed_query(query), dtype=np.float64)
 
         best_sim = 0.0
         best_entry = None
@@ -162,8 +162,8 @@ class SemanticCache:
             logger.debug("Cache SKIP (empty/short answer) — session=%s", session_id)
             return
 
-        # Embed query for storage
-        query_emb = embedding_model.encode([query])[0]
+        # Embed query — returns list[float], convert to ndarray for cosine similarity
+        query_emb = np.array(_embed_query(query), dtype=np.float64)
 
         if session_id not in self._store:
             self._store[session_id] = []
