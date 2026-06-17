@@ -1,59 +1,62 @@
 services:
   - type: web
-    name: ragbot-api
-    runtime: python
-    region: oregon           # Change to "frankfurt" or "singapore" if closer to users
-    plan: free               # Upgrade to "starter" for persistent disk & no cold starts
-
-    # Working directory is the repo root; source is the backend folder
-    rootDir: backend
-
-    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
-
-    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
-
+    name: ragbot-v2
+    env: python
+    region: oregon
+    plan: free
+    buildCommand: pip install -r backend/requirements.txt
+    startCommand: uvicorn backend.main:app --host 0.0.0.0 --port $PORT
     envVars:
+      # ── Required ──────────────────────────────────────────────────────────
       - key: GROQ_API_KEY
-        sync: false          # Set manually in Render dashboard → Environment
-
-      - key: GROQ_MODEL
-        value: llama3-8b-8192
-
-      - key: GOOGLE_CREDENTIALS_PATH
-        value: google-credentials.json
-
+        sync: false
+      - key: COHERE_API_KEY
+        sync: false
+      - key: RAGBOT_API_KEY
+        sync: false
+      # ── Qdrant ────────────────────────────────────────────────────────────
+      - key: QDRANT_URL
+        sync: false
+      - key: QDRANT_API_KEY
+        sync: false
+      - key: QDRANT_COLLECTION_PREFIX
+        value: ragbot
+      # ── Upstash ───────────────────────────────────────────────────────────
+      - key: UPSTASH_REDIS_URL
+        sync: false
+      - key: UPSTASH_REDIS_TOKEN
+        sync: false
+      # ── Supabase ──────────────────────────────────────────────────────────
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_KEY
+        sync: false
+      # ── Langfuse ──────────────────────────────────────────────────────────
+      - key: LANGFUSE_PUBLIC_KEY
+        sync: false
+      - key: LANGFUSE_SECRET_KEY
+        sync: false
+      - key: LANGFUSE_HOST
+        value: https://cloud.langfuse.com
+      # ── Google Sheets ─────────────────────────────────────────────────────
+      # Paste the entire service account JSON as a single line here
+      - key: GOOGLE_CREDENTIALS_JSON
+        sync: false
       - key: GOOGLE_SHEET_NAME
         value: RAG Chatbot Leads
-
+      # ── Email (SMTP — replaced in Phase 5) ───────────────────────────────
       - key: EMAIL_SENDER
         sync: false
-
       - key: EMAIL_PASSWORD
         sync: false
-
       - key: EMAIL_RECIPIENT
         sync: false
-
-      - key: MAX_FILE_SIZE_MB
-        value: "10"
-
-      - key: CHUNK_SIZE
-        value: "500"
-
-      - key: CHUNK_OVERLAP
-        value: "50"
-
-      - key: TOP_K_RESULTS
-        value: "3"
-
-      - key: CORS_ORIGIN
-        value: "*"           # Replace with your actual frontend URL in production
-
+      # ── App config ────────────────────────────────────────────────────────
       - key: ENV
         value: production
-
-    # Persist ChromaDB vector store across deploys (requires paid plan)
-    # disk:
-    #   name: vectorstore
-    #   mountPath: /opt/render/project/src/vectorstore
-    #   sizeGB: 1
+      - key: CORS_ORIGIN
+        value: "*"
+      - key: GROQ_MODEL
+        value: llama-3.3-70b-versatile
+      - key: GROQ_FALLBACK_MODEL
+        value: llama-3.1-8b-instant
