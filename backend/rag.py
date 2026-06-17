@@ -1,44 +1,97 @@
+"""
+rag.py — RAGbot v2, Phase 1
+
+Changes from v1:
+  [P1-R1] REMOVED: chromadb import, chroma_client initialization,
+                    ChromaDB telemetry suppression, _bm25_store dict.
+                    ChromaDB is gone entirely from this file.
+  [P1-R2] REMOVED: rank_bm25 import from top-level. Will be re-added in
+                    Phase 2 for sparse vector generation (BM25 → Qdrant SparseVector).
+                    Removed now so requirements.txt drop of chromadb doesn't
+                    leave dead imports that confuse the Phase 2 diff.
+  [P1-R3] ADDED:   qdrant_client initialization (QdrantClient).
+                    Phase 1 only calls ping_qdrant() — no collection ops yet.
+  [P1-R4] ADDED:   ping_qdrant() — health-check used by:
+                      - /health route in main.py
+                      - Qdrant keepalive scheduler job (every 9 min) in main.py
+                    Returns bool, never raises, always logs outcome.
+  [P1-R5] KEPT:    _embed_documents, _embed_query — untouched, no ChromaDB dependency.
+  [P1-R6] KEPT:    validate_pdf_bytes — untouched.
+  [P1-R7] KEPT:    extract_text_from_pdf — untouched (pypdf still in requirements
+                    until Phase 2 replaces it with pdfplumber + OCR fallback).
+  [P1-R8] KEPT:    chunk_text_hierarchical — untouched. Phase 2 changes chunk sizes
+                    (parent 1200/240, child 400/80) and adds payload metadata schema.
+  [P1-R9] STUBBED: store_chunks_hierarchical — logs and returns without writing.
+                    Phase 2 replaces with Qdrant dense+sparse upsert.
+  [P1-R10] STUBBED: retrieve_chunks_hybrid — returns [] with a warning.
+                    Phase 2 replaces with Qdrant hybrid search + RRF.
+  [P1-R11] STUBBED: session_exists — always returns False.
+                    Phase 2 returns True after Qdrant collection confirmed present.
+                    CONSEQUENCE: /chat 404s for all sessions until Phase 2.
+                    /upload still runs extract+chunk but does not persist.
+                    This is intentional — Phase 1 proves infrastructure, not data.
+  [P1-R12] KEPT:   process_pdf — runs extract+chunk pipeline end-to-end.
+                    Store step is stubbed so data is not persisted.
+  [P1-R13] KEPT:   delete_old_collections — no-op stub (scheduler job in main.py).
+                    Phase 2 replaces with Qdrant collection TTL cleanup.
+
+Phases that will touch this file next:
+  Phase 2: FULL REWRITE of everything below _embed_query.
+            Qdrant dense+sparse upsert, pdfplumber, OCR fallback,
+            SHA256 dedup, Supabase document registration, section headers.
+"""
+
 import logging
-from pypdf import PdfReader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-import cohere
-from rank_bm25 import BM25Okapi
-import chromadb
-from chromadb.config import Settings as ChromaSettings
-from config import get_settings
 from typing import Callable, Optional
 
+import cohere
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from pypdf import PdfReader
+from qdrant_client import QdrantClient
+from qdrant_client.http.exceptions import UnexpectedResponse
+
+from config import get_settings
+
 settings = get_settings()
-
-# ── Suppress ChromaDB telemetry noise ─────────────────────────────────────────
-logging.getLogger("chromadb.telemetry").setLevel(logging.CRITICAL)
-logging.getLogger("chromadb.telemetry.product.posthog").setLevel(logging.CRITICAL)
-logging.getLogger("posthog").setLevel(logging.CRITICAL)
-
 logger = logging.getLogger("ragbot.rag")
 
 # ── Cohere client ─────────────────────────────────────────────────────────────
 co = cohere.Client(settings.cohere_api_key)
 
-chroma_client = chromadb.PersistentClient(
-    path="vectorstore/", settings=ChromaSettings(anonymized_telemetry=False)
-)
+# ── [P1-R3] Qdrant client ────────────────────────────────────────────────────
+# Initialized at module load. If QDRANT_URL is empty (local dev without Qdrant),
+# the client init still succeeds — it will just fail on actual operations.
+# ping_qdrant() handles the empty-URL case gracefully.
+_qdrant: Optional[QdrantClient] = None
 
-# ── BM25 in-memory store ───────────────────────────────────────────────────────
-_bm25_store: dict[str, tuple[BM25Okapi, list[str], list[int]]] = {}
+if settings.qdrant_url:
+    try:
+        _qdrant = QdrantClient(
+            url=settings.qdrant_url,
+            api_key=settings.qdrant_api_key or None,
+            timeout=10,
+        )
+        logger.info("Qdrant client initialized — url=%s", settings.qdrant_url)
+    except Exception as _e:
+        logger.warning("Qdrant client init failed: %s — storage unavailable", _e)
+        _qdrant = None
+else:
+    logger.info(
+        "QDRANT_URL not set — Qdrant disabled. "
+        "Set QDRANT_URL and QDRANT_API_KEY to enable."
+    )
 
-# ── Cohere embedding helpers ──────────────────────────────────────────────────
+# ── Cohere embedding constants ────────────────────────────────────────────────
 _COHERE_EMBED_MODEL = "embed-english-v3.0"
 _COHERE_BATCH_SIZE = 96
 
 
+# ── [P1-R5] Embedding helpers — unchanged from v1 ───────────────────────────
 def _embed_documents(texts: list[str]) -> list[list[float]]:
     """
     Embed a list of document chunks via Cohere API.
     Uses search_document input type for indexing.
     Batches automatically for lists larger than 96.
-    Explicit float() cast on every value avoids Pylance type errors
-    from Cohere SDK returning str | Any in older type stubs.
     """
     all_embeddings: list[list[float]] = []
     for i in range(0, len(texts), _COHERE_BATCH_SIZE):
@@ -66,7 +119,7 @@ def _embed_query(query: str) -> list[float]:
     return [float(v) for v in list(response.embeddings)[0]]
 
 
-# ── PDF validation ────────────────────────────────────────────────────────────
+# ── [P1-R6] PDF validation — unchanged from v1 ──────────────────────────────
 _PDF_MAGIC = b"%PDF-"
 
 
@@ -74,7 +127,9 @@ def validate_pdf_bytes(data: bytes) -> bool:
     return data[:5] == _PDF_MAGIC
 
 
-# ── PDF text extraction ───────────────────────────────────────────────────────
+# ── [P1-R7] PDF text extraction — unchanged from v1 ─────────────────────────
+# Phase 2 replaces pypdf with pdfplumber + pytesseract OCR fallback.
+# Function signature stays identical so process_pdf needs no changes.
 def extract_text_from_pdf(file_path: str) -> tuple[str, int]:
     reader = PdfReader(file_path)
     page_count = len(reader.pages)
@@ -106,30 +161,23 @@ def extract_text_from_pdf(file_path: str) -> tuple[str, int]:
     return full_text, page_count
 
 
-# ── Hierarchical chunking ─────────────────────────────────────────────────────
+# ── [P1-R8] Hierarchical chunking — unchanged from v1 ───────────────────────
+# Phase 2 changes chunk sizes: parent 1200/240, child 400/80.
+# Phase 2 also adds page_number and section_header to payload metadata.
+# Function signature and return type stay identical.
 def chunk_text_hierarchical(text: str) -> tuple[list[str], list[str], list[int]]:
     """
     Split text into two levels of chunks.
 
-    Parent chunks (1000 chars, 100 overlap):
-        Sent to the LLM. Large enough to contain a complete thought,
-        a full policy clause, a complete instruction sequence.
-        These are what Groq reads. Context-rich.
+    Parent chunks (1000 chars, 100 overlap) — sent to the LLM.
+    Child chunks  (350 chars, 40 overlap)  — used for retrieval.
 
-    Child chunks (350 chars, 40 overlap):
-        Used for retrieval — searched by vector and BM25.
-        Small enough for embeddings to be precise and focused.
-        Each child knows which parent it came from via child_to_parent.
-
-    Why this works:
-        Search precision comes from small chunks.
-        Answer quality comes from large chunks.
-        Hierarchical chunking gives you both simultaneously.
+    Each child knows its parent index via child_to_parent.
 
     Returns:
-        child_chunks     — list of small retrieval-target strings
-        parent_chunks    — list of large LLM-context strings
-        child_to_parent  — child_to_parent[i] = index of parent for child i
+        child_chunks    — small retrieval-target strings
+        parent_chunks   — large LLM-context strings
+        child_to_parent — child_to_parent[i] = parent index for child i
     """
     parent_splitter = RecursiveCharacterTextSplitter(
         chunk_size=1000,
@@ -163,7 +211,7 @@ def chunk_text_hierarchical(text: str) -> tuple[list[str], list[str], list[int]]
         child_to_parent.extend([parent_idx] * len(children))
 
     logger.info(
-        "Chunking complete — parents: %d | children: %d | avg children/parent: %.1f",
+        "Chunking complete — parents=%d | children=%d | avg children/parent=%.1f",
         len(parent_chunks),
         len(child_chunks),
         len(child_chunks) / max(len(parent_chunks), 1),
@@ -172,7 +220,39 @@ def chunk_text_hierarchical(text: str) -> tuple[list[str], list[str], list[int]]
     return child_chunks, parent_chunks, child_to_parent
 
 
-# ── Storage ───────────────────────────────────────────────────────────────────
+# ── [P1-R4] Qdrant health check ──────────────────────────────────────────────
+def ping_qdrant() -> bool:
+    """
+    Ping the Qdrant cluster to verify it is reachable and to prevent
+    free-tier auto-suspension (Qdrant suspends after 7 days of no traffic).
+
+    Called by:
+      - /health route — returns result in health payload
+      - Scheduler keepalive job — fires every 9 minutes
+
+    Returns True if cluster responds, False otherwise.
+    Never raises — all exceptions are caught and logged.
+    """
+    if _qdrant is None:
+        logger.debug("ping_qdrant: client not initialized — skipping")
+        return False
+
+    try:
+        info = _qdrant.get_collections()
+        logger.debug(
+            "Qdrant ping ok — %d collection(s) visible",
+            len(info.collections),
+        )
+        return True
+    except UnexpectedResponse as exc:
+        logger.warning("Qdrant ping failed (HTTP %s): %s", exc.status_code, exc)
+        return False
+    except Exception as exc:
+        logger.warning("Qdrant ping failed: %s", exc)
+        return False
+
+
+# ── [P1-R9] Storage stub ─────────────────────────────────────────────────────
 def store_chunks_hierarchical(
     session_id: str,
     child_chunks: list[str],
@@ -180,76 +260,26 @@ def store_chunks_hierarchical(
     child_to_parent: list[int],
 ) -> None:
     """
-    Build three indexes for a session:
+    STUB — Phase 1 only.
 
-    1. ChromaDB child collection  — vector search on small, precise chunks
-    2. ChromaDB parent collection — fetch full-context chunks by ID
-    3. BM25 in-memory index       — keyword search on child chunks
-
-    Child chunks carry metadata {"parent_id": int} so we can resolve
-    any retrieved child back to its parent during retrieval.
+    Phase 2 replaces this with Qdrant dense+sparse upsert:
+      - One collection per session: {QDRANT_COLLECTION_PREFIX}_{session_id}
+      - Dense vector: Cohere embed-english-v3.0
+      - Sparse vector: BM25 term weights → Qdrant SparseVector
+      - Payload schema v2: doc_id, chunk_type, parent_id, page_number,
+                           section_header, text, char_start, char_end
     """
-    child_col_name = f"session_{session_id}_child"
-    parent_col_name = f"session_{session_id}_parent"
-
-    for name in [child_col_name, parent_col_name, f"session_{session_id}"]:
-        try:
-            chroma_client.delete_collection(name)
-        except Exception:
-            pass
-
-    # ── Child collection ──────────────────────────────────────────────────────
-    child_col = chroma_client.create_collection(
-        name=child_col_name, metadata={"hnsw:space": "cosine"}
-    )
-    child_embeddings = _embed_documents(child_chunks)
-    child_col.add(
-        documents=child_chunks,
-        embeddings=child_embeddings,
-        ids=[f"child_{i}" for i in range(len(child_chunks))],
-        metadatas=[{"parent_id": child_to_parent[i]} for i in range(len(child_chunks))],
-    )
-
-    # ── Parent collection ─────────────────────────────────────────────────────
-    parent_col = chroma_client.create_collection(
-        name=parent_col_name, metadata={"hnsw:space": "cosine"}
-    )
-    parent_embeddings = _embed_documents(parent_chunks)
-    parent_col.add(
-        documents=parent_chunks,
-        embeddings=parent_embeddings,
-        ids=[f"parent_{i}" for i in range(len(parent_chunks))],
-    )
-
-    # ── BM25 in-memory index ──────────────────────────────────────────────────
-    tokenized_children = [chunk.lower().split() for chunk in child_chunks]
-    bm25_index = BM25Okapi(tokenized_children)
-    _bm25_store[session_id] = (bm25_index, child_chunks, child_to_parent)
-
-    logger.info(
-        "Indexes built — session=%s | parents=%d | children=%d | BM25 ready",
+    logger.warning(
+        "store_chunks_hierarchical is a Phase 1 stub — "
+        "session=%s | parents=%d | children=%d — data NOT persisted. "
+        "Phase 2 wires Qdrant upsert.",
         session_id,
         len(parent_chunks),
         len(child_chunks),
     )
 
 
-# ── RRF fusion ────────────────────────────────────────────────────────────────
-def _reciprocal_rank_fusion(ranked_lists: list[list[str]], k: int = 60) -> list[str]:
-    """
-    Merge multiple ranked lists via Reciprocal Rank Fusion.
-    RRF_score(doc) = sum of 1 / (k + rank), rank is 1-indexed.
-    k=60 is the standard constant from the 2009 paper.
-    """
-    scores: dict[str, float] = {}
-    for ranked_list in ranked_lists:
-        for rank_idx, doc in enumerate(ranked_list):
-            rank = rank_idx + 1
-            scores[doc] = scores.get(doc, 0.0) + 1.0 / (k + rank)
-    return sorted(scores.keys(), key=lambda d: scores[d], reverse=True)
-
-
-# ── Hybrid retrieval ──────────────────────────────────────────────────────────
+# ── [P1-R10] Retrieval stub ───────────────────────────────────────────────────
 def retrieve_chunks_hybrid(
     session_id: str,
     query: str,
@@ -257,188 +287,37 @@ def retrieve_chunks_hybrid(
     hyde_query: Optional[str] = None,
 ) -> list[str]:
     """
-    Full hybrid retrieval pipeline with hierarchical parent resolution.
+    STUB — Phase 1 only. Returns empty list.
 
-    Step 1 — Vector search on child collection
-        Uses hyde_query for embedding if provided (HyDE),
-        otherwise uses original query.
-
-    Step 2 — BM25 keyword search on child chunks
-        Always uses original query — keyword search benefits from
-        the user's exact words, not a hypothetical document passage.
-
-    Step 3 — RRF fusion
-        Merges vector and BM25 child ranked lists into one fused list.
-
-    Step 4 — Parent resolution
-        For each top child, look up its parent_id.
-        Fetch the full parent chunk from ChromaDB.
-        Deduplicate (multiple children can share a parent).
-
-    Returns parent chunks — large, context-rich strings ready for
-    the reranker and then the LLM.
+    Phase 2 replaces this with Qdrant native hybrid search:
+      - Prefetch dense + sparse results
+      - RRF fusion server-side
+      - Parent resolution by payload filter
     """
-    if top_k is None:
-        top_k = settings.top_k_results
-
-    n_candidates = min(top_k * 3, 60)
-    child_col_name = f"session_{session_id}_child"
-
-    # ── Step 1: Vector search ─────────────────────────────────────────────────
-    vector_children: list[str] = []
-    text_to_parent: dict[str, int] = {}
-
-    vector_query = hyde_query if hyde_query else query
-
-    try:
-        child_col = chroma_client.get_collection(child_col_name)
-        query_embedding = _embed_query(vector_query)
-
-        results = child_col.query(
-            query_embeddings=[query_embedding],
-            n_results=min(n_candidates, child_col.count()),
-            include=["documents", "metadatas"],
-        )
-
-        if results["documents"] and results["documents"][0]:
-            vector_children = results["documents"][0]
-            for i, doc in enumerate(vector_children):
-                meta = results["metadatas"][0][i]
-                parent_id = meta.get("parent_id")
-                if parent_id is not None:
-                    text_to_parent[doc] = int(parent_id)
-
-    except Exception as exc:
-        logger.warning("Vector search failed for session=%s: %s", session_id, exc)
-
-    # ── Step 2: BM25 keyword search ───────────────────────────────────────────
-    bm25_children: list[str] = []
-
-    if session_id in _bm25_store:
-        bm25_index, all_children, child_to_parent_map = _bm25_store[session_id]
-        tokenized_query = query.lower().split()
-        bm25_scores = bm25_index.get_scores(tokenized_query)
-
-        scored = [
-            (all_children[i], float(bm25_scores[i]), child_to_parent_map[i])
-            for i in range(len(all_children))
-            if bm25_scores[i] > 0.0
-        ]
-
-        if scored:
-            scored.sort(key=lambda x: x[1], reverse=True)
-            for child_text, _, parent_id in scored[:n_candidates]:
-                bm25_children.append(child_text)
-                text_to_parent[child_text] = parent_id
-
-            logger.info(
-                "BM25 keyword matches: %d children for session=%s",
-                len(bm25_children),
-                session_id,
-            )
-        else:
-            logger.info(
-                "BM25: no keyword matches for session=%s — "
-                "query words not present verbatim in any child chunk",
-                session_id,
-            )
-    else:
-        logger.warning(
-            "BM25 index missing for session=%s "
-            "(server restarted after upload?) — vector only",
-            session_id,
-        )
-
-    # ── Step 3: Handle empty results ─────────────────────────────────────────
-    if not vector_children and not bm25_children:
-        logger.error("Both vector and BM25 returned empty for session=%s", session_id)
-        return []
-
-    # ── Step 4: RRF fusion ────────────────────────────────────────────────────
-    if not bm25_children:
-        top_children = vector_children
-    elif not vector_children:
-        top_children = bm25_children
-    else:
-        fused = _reciprocal_rank_fusion([vector_children, bm25_children])
-        top_children = fused
-
-    logger.info(
-        "Hybrid RRF — session=%s | vector=%d | bm25=%d | fused pool=%d",
+    logger.warning(
+        "retrieve_chunks_hybrid is a Phase 1 stub — "
+        "session=%s — returning []. Phase 2 wires Qdrant hybrid search.",
         session_id,
-        len(vector_children),
-        len(bm25_children),
-        len(top_children),
     )
-
-    # ── Step 5: Resolve children → parent chunks ──────────────────────────────
-    try:
-        parent_col = chroma_client.get_collection(f"session_{session_id}_parent")
-    except Exception as exc:
-        logger.error(
-            "Parent collection not found for session=%s: %s — "
-            "returning raw children as fallback",
-            session_id,
-            exc,
-        )
-        return top_children[:top_k]
-
-    seen_parent_ids: set[int] = set()
-    parent_docs: list[str] = []
-
-    for child_text in top_children:
-        if len(parent_docs) >= top_k:
-            break
-
-        parent_id = text_to_parent.get(child_text)
-        if parent_id is None:
-            continue
-
-        if parent_id in seen_parent_ids:
-            continue
-
-        seen_parent_ids.add(parent_id)
-
-        try:
-            result = parent_col.get(ids=[f"parent_{parent_id}"])
-            if result["documents"]:
-                parent_docs.append(result["documents"][0])
-        except Exception as exc:
-            logger.warning(
-                "Failed to fetch parent_%d for session=%s: %s",
-                parent_id,
-                session_id,
-                exc,
-            )
-
-    logger.info(
-        "Parent resolution — session=%s | unique parents fetched: %d | returning: %d",
-        session_id,
-        len(seen_parent_ids),
-        len(parent_docs),
-    )
-
-    return parent_docs
+    return []
 
 
-# ── Session existence check ───────────────────────────────────────────────────
+# ── [P1-R11] Session existence stub ──────────────────────────────────────────
 def session_exists(session_id: str) -> bool:
     """
-    Check for hierarchical collections first.
-    Falls back to legacy flat collection check for pre-hierarchical sessions.
+    STUB — Phase 1 only. Always returns False.
+
+    CONSEQUENCE: /chat 404s for every session until Phase 2.
+    This is intentional — Phase 1 proves infrastructure (Qdrant ping,
+    Langfuse trace, Upstash session store), not data persistence.
+
+    Phase 2 replaces this with a Qdrant collection_exists() check:
+        _qdrant.collection_exists(f"{prefix}_{session_id}")
     """
-    try:
-        chroma_client.get_collection(f"session_{session_id}_child")
-        return True
-    except Exception:
-        try:
-            chroma_client.get_collection(f"session_{session_id}")
-            return True
-        except Exception:
-            return False
+    return False
 
 
-# ── Full PDF pipeline ─────────────────────────────────────────────────────────
+# ── [P1-R12] Full PDF pipeline ───────────────────────────────────────────────
 def process_pdf(
     file_path: str,
     session_id: str,
@@ -446,8 +325,13 @@ def process_pdf(
     on_done: Optional[Callable] = None,
 ) -> tuple[int, int]:
     """
-    Full ingestion pipeline: extract → hierarchical chunk → store.
-    Returns (page_count, child_chunk_count).
+    Full ingestion pipeline: extract → chunk → store (stub in Phase 1).
+
+    extract_text_from_pdf and chunk_text_hierarchical run normally.
+    store_chunks_hierarchical is stubbed — data is NOT persisted until Phase 2.
+
+    Returns (page_count, child_chunk_count) — accurate values even in Phase 1
+    so the /upload response shows real numbers.
     """
     text, page_count = extract_text_from_pdf(file_path)
 
@@ -465,6 +349,7 @@ def process_pdf(
         except Exception:
             pass
 
+    # Phase 1: store is a stub — logs warning, does not persist
     store_chunks_hierarchical(session_id, child_chunks, parent_chunks, child_to_parent)
 
     if on_done:
@@ -476,9 +361,11 @@ def process_pdf(
     return page_count, len(child_chunks)
 
 
-# ── Background cleanup stub ───────────────────────────────────────────────────
-def delete_old_collections(max_age_seconds: int = 86400):
+# ── [P1-R13] Cleanup stub ────────────────────────────────────────────────────
+def delete_old_collections(max_age_seconds: int = 86400) -> None:
     """
-    Cleanup stub. Render free tier wipes everything on redeploy anyway.
+    No-op stub. Called by the 24-hour scheduler job in main.py.
+    Phase 2 replaces with Qdrant collection TTL cleanup based on
+    collection metadata timestamp.
     """
     pass
