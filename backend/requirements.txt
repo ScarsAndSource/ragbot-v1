@@ -1,62 +1,43 @@
-# RAGbot v2 — Phase 1 requirements
-# Changes from v1:
-#   REMOVED: chromadb (fully replaced by Qdrant)
-#   ADDED:   qdrant-client, upstash-redis, langfuse, supabase
-#   KEPT:    all other v1 deps unchanged
-#
-# Phase 2 changes:
-#   REMOVE:  pypdf
-#   ADD:     pdfplumber, pdf2image, pytesseract
-#
-# Phase 5 changes:
-#   ADD:     google-api-python-client (Gmail API over HTTPS)
-
-# ── LLM ───────────────────────────────────────────────────────────────────────
-groq>=0.11.0
-
-# ── Embeddings + reranking ────────────────────────────────────────────────────
+# ── LLM + Reranker ────────────────────────────────────────────────────────────
+groq>=0.9.0
 cohere>=5.0.0
 
-# ── Vector store (Phase 1+) ───────────────────────────────────────────────────
-qdrant-client>=1.9.0
+# ── Embeddings + sparse vectors ────────────────────────────────────────────────
+rank-bm25>=0.2.2        # still used for sparse vector generation in rag.py
 
-# ── Caching + session store (Phase 1+) ───────────────────────────────────────
+# ── Vector store ──────────────────────────────────────────────────────────────
+qdrant-client>=1.7.0,<2.0.0   # P2: hybrid search (query_points + Prefetch + RRF)
+
+# ── PDF extraction — P2: pdfplumber replaces pypdf ────────────────────────────
+pdfplumber>=0.10.0
+pdf2image>=1.16.0       # OCR fallback — converts PDF pages to images
+pytesseract>=0.3.10     # OCR fallback — Tesseract wrapper
+
+# ── Database + cache ──────────────────────────────────────────────────────────
+supabase>=2.0.0
 upstash-redis>=1.0.0
 
-# ── Observability (Phase 1+) ──────────────────────────────────────────────────
+# ── Observability ─────────────────────────────────────────────────────────────
 langfuse>=2.0.0
 
-# ── Database (Phase 1+) ───────────────────────────────────────────────────────
-supabase>=2.4.0
-
 # ── Web framework ─────────────────────────────────────────────────────────────
-fastapi>=0.111.0
-uvicorn[standard]>=0.30.0
+fastapi>=0.110.0
+uvicorn[standard]>=0.29.0
 python-multipart>=0.0.9
-
-# ── Rate limiting ─────────────────────────────────────────────────────────────
 slowapi>=0.1.9
 
-# ── Scheduler ─────────────────────────────────────────────────────────────────
-apscheduler>=3.10.4
-
-# ── PDF processing ────────────────────────────────────────────────────────────
-# Phase 2: remove pypdf, add pdfplumber + pdf2image + pytesseract
-pypdf>=4.2.0
-
-# ── Chunking ──────────────────────────────────────────────────────────────────
-langchain-text-splitters>=0.2.0
-
-# ── BM25 sparse vectors (used in Phase 2 Qdrant upsert) ──────────────────────
-rank-bm25>=0.2.2
-
-# ── Google Sheets + Auth ──────────────────────────────────────────────────────
-gspread>=6.1.2
+# ── Google integrations ────────────────────────────────────────────────────────
+gspread>=6.0.0
 google-auth>=2.29.0
-# Phase 5: add google-api-python-client for Gmail API
+google-api-python-client>=2.120.0  # Phase 5: Gmail API (already declared early)
+
+# ── Scheduler + HTTP ──────────────────────────────────────────────────────────
+apscheduler>=3.10.0
+httpx>=0.27.0
 
 # ── Config ────────────────────────────────────────────────────────────────────
-pydantic-settings>=2.2.1
+pydantic>=2.0.0
+pydantic-settings>=2.0.0
 
-# ── Math (cache cosine similarity) ───────────────────────────────────────────
+# ── Utils ─────────────────────────────────────────────────────────────────────
 numpy>=1.26.0
