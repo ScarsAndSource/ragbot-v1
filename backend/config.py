@@ -2,11 +2,12 @@
 config.py — RAGbot v2
 Phase 1: added Qdrant, Upstash, Supabase, Langfuse vars; Google creds from env
 Phase 2: added qdrant_payload_schema_version
-Phase 3: recalibrate cache_similarity_threshold, guardrail_min_rerank_score
+Phase 3: recalibrated thresholds; added cache_lru_eviction, cache_ttl_seconds, lead_classifier_threshold
 Phase 4: add groq_fallback_model, groq_streaming
 Phase 5: replace email_sender/email_password with gmail_credentials_path
 Phase 6: add client_domain, client_name, client_practice_info
 """
+
 from pydantic_settings import BaseSettings
 from functools import lru_cache
 
@@ -41,28 +42,31 @@ class Settings(BaseSettings):
     max_file_size_mb: int = 10
 
     # ── Chunking (Phase 2 sizes wired in rag.py constants, not config) ────────
-    chunk_size: int = 400       # kept for backward compat — not used by P2 chunker
-    chunk_overlap: int = 60     # kept for backward compat
+    chunk_size: int = 400  # kept for backward compat — not used by P2 chunker
+    chunk_overlap: int = 60  # kept for backward compat
 
     # ── Retrieval ─────────────────────────────────────────────────────────────
-    top_k_results: int = 20     # child chunks fetched per dense/sparse prefetch
-    top_k_reranked: int = 5     # parents returned to LLM after Cohere rerank
+    top_k_results: int = 20  # child chunks fetched per dense/sparse prefetch
+    top_k_reranked: int = 5  # parents returned to LLM after Cohere rerank
     use_hyde: bool = False
 
     # ── Semantic cache ────────────────────────────────────────────────────────
-    cache_similarity_threshold: float = 0.92   # Phase 3: recalibrate to 0.88
+    cache_similarity_threshold: float = 0.88  # P3: recalibrated from 0.92
     cache_max_size: int = 100
-    # Phase 3 — cache_lru_eviction: bool = True
-    # Phase 3 — cache_ttl_seconds: int = 86400
+    cache_lru_eviction: bool = True  # P3: LRU eviction in Redis ZSet
+    cache_ttl_seconds: int = 86400  # P3: Redis key TTL (24 h)
 
     # ── Output guardrail ──────────────────────────────────────────────────────
-    guardrail_min_rerank_score: float = 0.20   # Phase 3: recalibrate to 0.18
+    guardrail_min_rerank_score: float = 0.18  # P3: recalibrated from 0.20
+
+    # ── Lead classifier ───────────────────────────────────────────────────────
+    lead_classifier_threshold: float = 0.6  # P3: min confidence to flag a lead
 
     # ── Qdrant ────────────────────────────────────────────────────────────────
     qdrant_url: str = ""
     qdrant_api_key: str = ""
     qdrant_collection_prefix: str = "ragbot"
-    qdrant_payload_schema_version: int = 2     # P2: bump when payload schema changes
+    qdrant_payload_schema_version: int = 2  # P2: bump when payload schema changes
 
     # ── Upstash Redis ─────────────────────────────────────────────────────────
     upstash_redis_url: str = ""

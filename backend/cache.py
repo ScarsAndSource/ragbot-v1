@@ -1,123 +1,142 @@
+"""
+cache.py — RAGbot v2, Phase 3
+Full replacement of in-memory SemanticCache with Upstash Redis backend.
+
+External interface is IDENTICAL to v1 — chat.py import unchanged:
+    from cache import semantic_cache
+    semantic_cache.get(query, session_id)
+    semantic_cache.set(query, answer, session_id, lead_triggered, chunks)
+    semantic_cache.clear(session_id)
+    semantic_cache.stats(session_id)
+    semantic_cache.global_stats()
+
+Storage layout (Redis):
+    HASH  cache:{session_id}:entries   field=query_hash → JSON payload
+    ZSET  cache:{session_id}:lru       member=query_hash, score=unix_ts
+
+Embedding storage:
+    float32 numpy array → tobytes() → base64 string
+    1024 dims × 4 bytes = 4 KB → ~5.5 KB base64 per entry
+    100 entries ≈ 550 KB — acceptable for Upstash REST calls
+
+LRU eviction:
+    ZSet score = last-access timestamp.
+    On every cache miss / set: if len > cache_max_size, pop lowest score.
+    On hit: zadd with XX to refresh score without creating duplicate.
+
+TTL:
+    Both keys get EXPIRE set on every write = cache_ttl_seconds (24 h default).
+    Effectively a sliding window — active sessions stay alive.
+
+Fallback:
+    When Upstash not configured or unreachable, silently falls back to
+    the same in-memory dict used in v1. Zero disruption to the pipeline.
+"""
+
+import base64
+import hashlib
+import json
 import logging
+import time
+from typing import Optional
+
 import numpy as np
-from rag import _embed_query
+
 from config import get_settings
+from rag import _embed_query
 
 settings = get_settings()
 logger = logging.getLogger("ragbot.cache")
 
+# ── Upstash Redis lazy client ─────────────────────────────────────────────────
+_redis = None
 
+
+def _get_redis():
+    global _redis
+    if _redis is None:
+        if settings.upstash_redis_url and settings.upstash_redis_token:
+            try:
+                from upstash_redis import Redis
+                _redis = Redis(
+                    url=settings.upstash_redis_url,
+                    token=settings.upstash_redis_token,
+                )
+                _redis.ping()
+                logger.info("Upstash Redis cache connected")
+            except Exception as exc:
+                logger.warning(
+                    "Upstash Redis unavailable (%s) — falling back to in-memory cache",
+                    exc,
+                )
+                _redis = None
+        else:
+            logger.info("Upstash not configured — using in-memory cache")
+    return _redis
+
+
+# ── Embedding serialization ───────────────────────────────────────────────────
+def _emb_encode(emb: list[float]) -> str:
+    """float list → float32 bytes → base64 string. ~5.5 KB for 1024 dims."""
+    return base64.b64encode(
+        np.array(emb, dtype=np.float32).tobytes()
+    ).decode("ascii")
+
+
+def _emb_decode(b64: str) -> np.ndarray:
+    """base64 string → float32 numpy array."""
+    return np.frombuffer(base64.b64decode(b64), dtype=np.float32)
+
+
+# ── Cosine similarity ─────────────────────────────────────────────────────────
+def _cosine(a: np.ndarray, b: np.ndarray) -> float:
+    na, nb = np.linalg.norm(a), np.linalg.norm(b)
+    if na == 0.0 or nb == 0.0:
+        return 0.0
+    return float(np.dot(a, b) / (na * nb))
+
+
+# ── Key helpers ───────────────────────────────────────────────────────────────
+def _entries_key(session_id: str) -> str:
+    return f"cache:{session_id}:entries"
+
+
+def _lru_key(session_id: str) -> str:
+    return f"cache:{session_id}:lru"
+
+
+def _query_hash(query: str) -> str:
+    return hashlib.sha256(query.encode()).hexdigest()[:16]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SemanticCache — Redis path + in-memory fallback
+# ══════════════════════════════════════════════════════════════════════════════
 class SemanticCache:
     """
-    In-memory semantic similarity cache for RAG query-answer pairs.
+    Semantic similarity cache backed by Upstash Redis.
+    Falls back to in-memory dict when Redis is unavailable.
 
-    How it works:
-        Every answered query gets stored as (embedding, answer, metadata).
-        On a new query, we embed it and compute cosine similarity against
-        every stored embedding for that session. If the highest similarity
-        exceeds the threshold, we return the cached answer immediately —
-        skipping hybrid search, Cohere rerank, and the Groq LLM call.
-
-    Why per-session scoping:
-        Each session has its own document. Client A's chatbot cached answers
-        about their return policy must never surface when Client B asks about
-        their product manual. Session IDs are the isolation boundary.
-
-    Why FIFO eviction:
-        Oldest entries are least likely to be re-asked. Simplest eviction
-        strategy that keeps memory bounded without LRU overhead.
-
-    Thread safety:
-        This implementation is single-process safe. FastAPI's async routes
-        don't create true threads for synchronous code, so the in-memory
-        dict is safe on Render's single-instance deployment. For multi-instance
-        deployments, replace _store with Redis — interface stays identical.
-
-    Redis upgrade path (when you need it):
-        Replace self._store dict operations with:
-        - redis.get(f"cache:{session_id}") → json.loads → list of entries
-        - redis.setex(f"cache:{session_id}", ttl, json.dumps(entries))
-        Embeddings stored as base64-encoded numpy arrays in the JSON.
-        Everything else stays the same.
+    All public methods have identical signatures to v1 — zero changes in
+    chat.py or main.py are needed.
     """
 
     def __init__(self):
-        # session_id → list of cache entry dicts
-        # Each entry: {embedding, answer, query, lead_triggered, chunks}
-        self._store: dict[str, list[dict]] = {}
+        # In-memory fallback store (same shape as v1)
+        self._mem: dict[str, list[dict]] = {}
 
-    # ── Similarity ────────────────────────────────────────────────────────────
-    def _cosine_similarity(self, a: np.ndarray, b: np.ndarray) -> float:
-        """
-        Standard cosine similarity between two embedding vectors.
-        Returns 0.0 if either vector is zero-norm (degenerate case).
-        """
-        norm_a = np.linalg.norm(a)
-        norm_b = np.linalg.norm(b)
-        if norm_a == 0.0 or norm_b == 0.0:
-            return 0.0
-        return float(np.dot(a, b) / (norm_a * norm_b))
+    # ── Public interface ──────────────────────────────────────────────────────
 
-    # ── Read ──────────────────────────────────────────────────────────────────
     def get(
         self,
         query: str,
         session_id: str,
     ) -> tuple[str, bool, list[str]] | None:
-        """
-        Check if a semantically similar query has already been answered.
+        r = _get_redis()
+        if r is not None:
+            return self._redis_get(query, session_id, r)
+        return self._mem_get(query, session_id)
 
-        Scans all cache entries for this session, finds the one with the
-        highest cosine similarity to the incoming query, and returns its
-        stored answer if similarity >= threshold.
-
-        Returns:
-            (answer, lead_triggered, chunks) if cache hit
-            None if cache miss
-        """
-        entries = self._store.get(session_id, [])
-
-        if not entries:
-            logger.debug("Cache empty for session=%s — miss", session_id)
-            return None
-
-        # Embed the incoming query — returns list[float], convert to ndarray
-        query_emb = np.array(_embed_query(query), dtype=np.float64)
-
-        best_sim = 0.0
-        best_entry = None
-
-        for entry in entries:
-            sim = self._cosine_similarity(query_emb, entry["embedding"])
-            if sim > best_sim:
-                best_sim = sim
-                best_entry = entry
-
-        if best_sim >= settings.cache_similarity_threshold and best_entry is not None:
-            logger.info(
-                "Cache HIT — session=%s | similarity=%.4f | threshold=%.2f | "
-                "matched: '%s...' | saved: hybrid search + rerank + LLM call",
-                session_id,
-                best_sim,
-                settings.cache_similarity_threshold,
-                best_entry["query"][:60],
-            )
-            return (
-                best_entry["answer"],
-                best_entry["lead_triggered"],
-                best_entry["chunks"],
-            )
-
-        logger.info(
-            "Cache MISS — session=%s | best similarity=%.4f | threshold=%.2f | "
-            "proceeding to full pipeline",
-            session_id,
-            best_sim,
-            settings.cache_similarity_threshold,
-        )
-        return None
-
-    # ── Write ─────────────────────────────────────────────────────────────────
     def set(
         self,
         query: str,
@@ -126,101 +145,264 @@ class SemanticCache:
         lead_triggered: bool = False,
         chunks: list[str] | None = None,
     ) -> None:
-        """
-        Store a query-answer pair after a successful full pipeline run.
-
-        What gets cached:
-            Normal document Q&A responses — yes.
-            "I don't have that information" responses — yes.
-                Within a session the document is fixed, so negative answers
-                are correct and should be cached too.
-
-        What does NOT get cached:
-            Lead-triggered responses — no.
-                When a user is in purchase/contact intent, we want the
-                pipeline to run fresh each time. Lead detection may behave
-                differently across messages and caching these breaks the
-                lead capture flow.
-
-            Empty or too-short answers — no.
-                These are error states, not real answers.
-        """
         if chunks is None:
             chunks = []
 
-        # Skip caching lead-triggered responses
+        # Never cache lead-triggered or empty answers — same rule as v1
         if lead_triggered:
-            logger.debug(
-                "Cache SKIP (lead triggered) — session=%s | query: '%s...'",
-                session_id,
-                query[:60],
-            )
+            logger.debug("Cache SKIP (lead) — session=%s", session_id)
             return
-
-        # Skip caching empty or error responses
         if not answer or len(answer.strip()) < 10:
-            logger.debug("Cache SKIP (empty/short answer) — session=%s", session_id)
+            logger.debug("Cache SKIP (short answer) — session=%s", session_id)
             return
 
-        # Embed query — returns list[float], convert to ndarray for cosine similarity
-        query_emb = np.array(_embed_query(query), dtype=np.float64)
+        r = _get_redis()
+        if r is not None:
+            self._redis_set(query, answer, session_id, lead_triggered, chunks, r)
+        else:
+            self._mem_set(query, answer, session_id, lead_triggered, chunks)
 
-        if session_id not in self._store:
-            self._store[session_id] = []
+    def clear(self, session_id: str) -> int:
+        r = _get_redis()
+        if r is not None:
+            return self._redis_clear(session_id, r)
+        return self._mem_clear(session_id)
 
-        self._store[session_id].append(
-            {
-                "embedding": query_emb,
-                "answer": answer,
-                "query": query,
-                "lead_triggered": lead_triggered,
-                "chunks": chunks,
-            }
-        )
+    def stats(self, session_id: str) -> dict:
+        r = _get_redis()
+        if r is not None:
+            return self._redis_stats(session_id, r)
+        return self._mem_stats(session_id)
 
-        current_size = len(self._store[session_id])
+    def global_stats(self) -> dict:
+        r = _get_redis()
+        if r is not None:
+            return {"backend": "upstash_redis", "note": "per-session stats via stats()"}
+        total = sum(len(v) for v in self._mem.values())
+        return {
+            "backend": "in_memory",
+            "total_sessions_cached": len(self._mem),
+            "total_entries": total,
+            "sessions": list(self._mem.keys()),
+        }
 
-        # FIFO eviction — remove oldest entry when over limit
-        if current_size > settings.cache_max_size:
-            evicted = self._store[session_id].pop(0)
-            logger.debug(
-                "Cache EVICT (FIFO) — session=%s | evicted: '%s...'",
-                session_id,
-                evicted["query"][:40],
+    # ── Redis implementation ──────────────────────────────────────────────────
+
+    def _redis_get(
+        self, query: str, session_id: str, r
+    ) -> tuple[str, bool, list[str]] | None:
+        ek = _entries_key(session_id)
+        lk = _lru_key(session_id)
+
+        try:
+            raw_entries = r.hgetall(ek)
+        except Exception as exc:
+            logger.warning("Redis HGETALL failed: %s — cache miss", exc)
+            return None
+
+        if not raw_entries:
+            logger.debug("Cache empty (Redis) — session=%s", session_id)
+            return None
+
+        query_emb = np.array(_embed_query(query), dtype=np.float32)
+        best_sim = 0.0
+        best_entry = None
+        best_hash = None
+
+        for qhash, payload_str in raw_entries.items():
+            try:
+                entry = json.loads(payload_str)
+                stored_emb = _emb_decode(entry["embedding_b64"])
+                sim = _cosine(query_emb, stored_emb)
+                if sim > best_sim:
+                    best_sim = sim
+                    best_entry = entry
+                    best_hash = qhash
+            except Exception as exc:
+                logger.debug("Skipping malformed cache entry %s: %s", qhash, exc)
+                continue
+
+        if best_sim >= settings.cache_similarity_threshold and best_entry:
+            # Refresh LRU score on hit
+            try:
+                r.zadd(lk, {best_hash: time.time()})
+            except Exception:
+                pass
+
+            logger.info(
+                "Cache HIT (Redis) — session=%s | sim=%.4f | matched: '%s…'",
+                session_id, best_sim, best_entry.get("query", "")[:60],
             )
-            current_size -= 1
+            return (
+                best_entry["answer"],
+                best_entry["lead_triggered"],
+                best_entry.get("chunks", []),
+            )
 
         logger.info(
-            "Cache STORE — session=%s | entries now: %d/%d | query: '%s...'",
-            session_id,
-            current_size,
-            settings.cache_max_size,
-            query[:60],
+            "Cache MISS (Redis) — session=%s | best_sim=%.4f | threshold=%.2f",
+            session_id, best_sim, settings.cache_similarity_threshold,
+        )
+        return None
+
+    def _redis_set(
+        self,
+        query: str,
+        answer: str,
+        session_id: str,
+        lead_triggered: bool,
+        chunks: list[str],
+        r,
+    ) -> None:
+        ek = _entries_key(session_id)
+        lk = _lru_key(session_id)
+        qhash = _query_hash(query)
+        now = time.time()
+
+        query_emb = _embed_query(query)
+        entry = {
+            "embedding_b64": _emb_encode(query_emb),
+            "answer": answer,
+            "query": query,
+            "lead_triggered": lead_triggered,
+            "chunks": chunks,
+            "timestamp": now,
+        }
+
+        try:
+            r.hset(ek, qhash, json.dumps(entry))
+            r.zadd(lk, {qhash: now})
+
+            # LRU eviction — remove oldest if over limit
+            if settings.cache_lru_eviction:
+                count = r.zcard(lk)
+                if count > settings.cache_max_size:
+                    oldest = r.zrange(lk, 0, 0)
+                    if oldest:
+                        evict_hash = oldest[0]
+                        r.hdel(ek, evict_hash)
+                        r.zrem(lk, evict_hash)
+                        logger.debug(
+                            "Cache EVICT (LRU/Redis) — session=%s | removed hash=%s",
+                            session_id, evict_hash,
+                        )
+                        count -= 1
+
+            # Sliding TTL — keep active sessions alive
+            r.expire(ek, settings.cache_ttl_seconds)
+            r.expire(lk, settings.cache_ttl_seconds)
+
+            current = r.hlen(ek)
+            logger.info(
+                "Cache STORE (Redis) — session=%s | entries=%d | query: '%s…'",
+                session_id, current, query[:60],
+            )
+        except Exception as exc:
+            logger.error("Redis cache SET failed: %s — falling back to mem", exc)
+            self._mem_set(query, answer, session_id, lead_triggered, chunks)
+
+    def _redis_clear(self, session_id: str, r) -> int:
+        ek = _entries_key(session_id)
+        lk = _lru_key(session_id)
+        try:
+            count = r.hlen(ek) or 0
+            r.delete(ek)
+            r.delete(lk)
+            if count:
+                logger.info(
+                    "Cache CLEAR (Redis) — session=%s | removed %d entries",
+                    session_id, count,
+                )
+            return count
+        except Exception as exc:
+            logger.error("Redis cache CLEAR failed: %s", exc)
+            return 0
+
+    def _redis_stats(self, session_id: str, r) -> dict:
+        try:
+            count = r.hlen(_entries_key(session_id)) or 0
+        except Exception:
+            count = 0
+        return {
+            "backend": "upstash_redis",
+            "session_id": session_id,
+            "entries": count,
+            "max_entries": settings.cache_max_size,
+            "threshold": settings.cache_similarity_threshold,
+            "ttl_seconds": settings.cache_ttl_seconds,
+        }
+
+    # ── In-memory fallback ────────────────────────────────────────────────────
+
+    def _mem_get(
+        self, query: str, session_id: str
+    ) -> tuple[str, bool, list[str]] | None:
+        entries = self._mem.get(session_id, [])
+        if not entries:
+            return None
+
+        query_emb = np.array(_embed_query(query), dtype=np.float32)
+        best_sim, best_entry = 0.0, None
+
+        for e in entries:
+            sim = _cosine(query_emb, e["embedding"])
+            if sim > best_sim:
+                best_sim = sim
+                best_entry = e
+
+        if best_sim >= settings.cache_similarity_threshold and best_entry:
+            logger.info(
+                "Cache HIT (mem) — session=%s | sim=%.4f | '%s…'",
+                session_id, best_sim, best_entry["query"][:60],
+            )
+            return best_entry["answer"], best_entry["lead_triggered"], best_entry["chunks"]
+
+        logger.info(
+            "Cache MISS (mem) — session=%s | best_sim=%.4f", session_id, best_sim
+        )
+        return None
+
+    def _mem_set(
+        self,
+        query: str,
+        answer: str,
+        session_id: str,
+        lead_triggered: bool,
+        chunks: list[str],
+    ) -> None:
+        query_emb = np.array(_embed_query(query), dtype=np.float32)
+
+        if session_id not in self._mem:
+            self._mem[session_id] = []
+
+        self._mem[session_id].append({
+            "embedding": query_emb,
+            "answer": answer,
+            "query": query,
+            "lead_triggered": lead_triggered,
+            "chunks": chunks,
+        })
+
+        if len(self._mem[session_id]) > settings.cache_max_size:
+            evicted = self._mem[session_id].pop(0)
+            logger.debug("Cache EVICT (FIFO/mem) — '%s…'", evicted["query"][:40])
+
+        logger.info(
+            "Cache STORE (mem) — session=%s | entries=%d | '%s…'",
+            session_id, len(self._mem[session_id]), query[:60],
         )
 
-    # ── Clear ─────────────────────────────────────────────────────────────────
-    def clear(self, session_id: str) -> int:
-        """
-        Remove all cache entries for a session.
-        Called when a session's conversation history is cleared.
-        Returns number of entries removed.
-        """
-        entries = self._store.pop(session_id, [])
+    def _mem_clear(self, session_id: str) -> int:
+        entries = self._mem.pop(session_id, [])
         count = len(entries)
-        if count > 0:
-            logger.info(
-                "Cache CLEAR — session=%s | removed %d entries", session_id, count
-            )
+        if count:
+            logger.info("Cache CLEAR (mem) — session=%s | removed %d", session_id, count)
         return count
 
-    # ── Stats ─────────────────────────────────────────────────────────────────
-    def stats(self, session_id: str) -> dict:
-        """
-        Return cache statistics for a session.
-        Used for logging and the future analytics dashboard.
-        """
-        entries = self._store.get(session_id, [])
+    def _mem_stats(self, session_id: str) -> dict:
+        entries = self._mem.get(session_id, [])
         return {
+            "backend": "in_memory",
             "session_id": session_id,
             "entries": len(entries),
             "max_entries": settings.cache_max_size,
@@ -228,21 +410,6 @@ class SemanticCache:
             "cached_queries": [e["query"][:60] for e in entries],
         }
 
-    # ── Global stats ──────────────────────────────────────────────────────────
-    def global_stats(self) -> dict:
-        """
-        Return stats across all sessions.
-        Useful for understanding overall cache utilization.
-        """
-        total_entries = sum(len(v) for v in self._store.values())
-        return {
-            "total_sessions_cached": len(self._store),
-            "total_entries": total_entries,
-            "sessions": list(self._store.keys()),
-        }
-
 
 # ── Singleton ─────────────────────────────────────────────────────────────────
-# One cache instance for the entire server process.
-# All imports of this module get the same object.
-semantic_cache = SemanticCache()
+semantic_cache = SemanticCache()    

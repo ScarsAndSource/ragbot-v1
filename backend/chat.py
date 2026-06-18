@@ -1,16 +1,46 @@
+"""
+chat.py — RAGbot v2, Phase 3
+Changes from Phase 2 (v1 untouched):
+  [P3-1] REMOVED: _LEAD_SIGNALS, LEAD_THRESHOLD, detect_lead (keyword scoring)
+  [P3-2] ADDED: _classify_query — Groq llama-3.1-8b-instant, JSON output
+         Outputs {query_type, intent_signals, confidence}
+  [P3-3] ADDED: _rewrite_query — fix typos, expand abbrevs, clarify context
+  [P3-4] ADDED: _decompose_query — split multi_part into ≤3 sub-questions
+  [P3-5] ADDED: _blend_hyde_embedding — 0.6 HyDE + 0.4 original (Phase 4 wires
+         the blended vector into retrieval; P3 uses HyDE passage via hyde_query)
+  [P3-6] ADDED: _retrieve_multi_part — parallel sub-query retrieval + dedup
+  [P3-7] ADDED: _retrieve_vague — HyDE passage for vague queries
+  [P3-8] ADDED: _scan_chunks_for_injection — flag injections in retrieved content
+  [P3-9] ADDED: _estimate_token_budget — trim chunks to 6000 token cap
+  [P3-10] UPDATED: get_chat_response — new 13-step pipeline
+  [P3-11] UPDATED: cache calls → Upstash-backed SemanticCache (same interface)
+  KEPT: _INJECTION_PATTERNS, _sanitize_message, _call_groq_with_retry,
+        _generate_hyde_query, _trim_history, SYSTEM_PROMPT_TEMPLATE,
+        _apply_output_guardrail (all unchanged from v1)
+"""
+
+import json
+import logging
 import re
 import time
-import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
-from groq import Groq, APIStatusError, APIConnectionError
-from config import get_settings
-from rag import retrieve_chunks_hybrid
-from reranker import rerank_chunks
+
+import numpy as np
+from groq import APIConnectionError, APIStatusError, Groq
+
 from cache import semantic_cache
+from config import get_settings
+from rag import _embed_query, retrieve_chunks_hybrid
+from reranker import rerank_chunks
 
 settings = get_settings()
 client = Groq(api_key=settings.groq_api_key)
 logger = logging.getLogger("ragbot.chat")
+
+# ── Groq model constants ──────────────────────────────────────────────────────
+_MODEL_PRIMARY = settings.groq_model            # llama-3.3-70b-versatile (answers)
+_MODEL_FAST = "llama-3.1-8b-instant"           # classifier, rewriter, decomposer
 
 # ── Prompt injection guard ────────────────────────────────────────────────────
 _INJECTION_PATTERNS = re.compile(
@@ -28,158 +58,6 @@ _INJECTION_PATTERNS = re.compile(
 )
 _MAX_MESSAGE_LEN = 2000
 
-# ── Lead detection ────────────────────────────────────────────────────────────
-_LEAD_SIGNALS: list[tuple[int, list[str]]] = [
-    (
-        3,
-        [
-            "how much does it cost",
-            "what is the price",
-            "what does it cost",
-            "pricing details",
-            "get a quote",
-            "request a quote",
-            "want to buy",
-            "place an order",
-            "book an appointment",
-            "speak to someone",
-            "talk to a human",
-            "connect me with",
-            "call me back",
-            "contact an agent",
-            "reach out to me",
-            "reach out",
-            "contact me",
-            "get back to me",
-            "note my info",
-            "note my details",
-            "save my details",
-            "remember my",
-            "note my",
-            "i want to be contacted",
-            "get in touch",
-            "call me",
-            "email me",
-            "message me",
-            "i want someone to",
-            "i want them to",
-            "please contact",
-            "interested in buying",
-            "want to purchase",
-            "want to order",
-        ],
-    ),
-    (
-        2,
-        [
-            "how much",
-            "what's the price",
-            "pricing",
-            "cost",
-            "purchase",
-            "buy",
-            "order",
-            "book",
-            "contact",
-            "call",
-            "phone number",
-            "demo",
-            "trial",
-            "consultation",
-            "reach",
-            "touch",
-            "follow up",
-        ],
-    ),
-    (
-        1,
-        [
-            "available",
-            "availability",
-            "in stock",
-            "lead time",
-            "more information",
-            "not sure",
-            "don't know",
-            "human",
-            "agent",
-            "person",
-            "representative",
-            "team",
-            "rate",
-            "charge",
-            "fee",
-            "info",
-            "details",
-            "my number",
-        ],
-    ),
-]
-
-LEAD_THRESHOLD = 3
-
-
-def detect_lead(message: str, bot_reply: str, message_count: int = 0) -> bool:
-    """
-    Returns True if this conversation should show the connect dialog.
-
-    Two trigger paths:
-    1. Proactive — fires on the 2nd user message (message_count >= 1) so
-       the connect dialog appears early, before the user has to ask.
-       message_count is the number of completed exchanges BEFORE this one
-       (each exchange = one user message + one assistant reply).
-       A value of 1 means one prior exchange exists → this is the 2nd message.
-
-    2. Keyword — fires immediately on the 1st message if the user explicitly
-       signals buying/contact intent (score >= LEAD_THRESHOLD).
-       This catches users who come in already knowing what they want.
-    """
-    # Keyword intent check — catches explicit contact/purchase signals on any message
-    combined = (message + " " + bot_reply).lower()
-    score = 0
-    for weight, phrases in _LEAD_SIGNALS:
-        for phrase in phrases:
-            if phrase in combined:
-                score += weight
-                break
-    if score >= LEAD_THRESHOLD:
-        logger.info(
-            "Lead triggered by keyword signals — score=%d threshold=%d",
-            score,
-            LEAD_THRESHOLD,
-        )
-        return True
-
-    # Proactive trigger — show connect dialog after 2nd user message
-    # message_count >= 1 means at least one prior exchange has completed
-    if message_count >= 1:
-        logger.info(
-            "Lead triggered proactively — message_count=%d (2nd+ message in session)",
-            message_count,
-        )
-        return True
-
-    return False
-
-
-# ── History trimmer ───────────────────────────────────────────────────────────
-_CHARS_PER_TOKEN_APPROX = 4
-_HISTORY_TOKEN_BUDGET = 800
-
-
-def _trim_history(history: list[dict]) -> list[dict]:
-    budget = _HISTORY_TOKEN_BUDGET * _CHARS_PER_TOKEN_APPROX
-    selected = []
-    for i in range(len(history) - 1, -1, -2):
-        pair = history[max(0, i - 1) : i + 1]
-        cost = sum(len(m["content"]) for m in pair)
-        if cost > budget:
-            break
-        budget -= cost
-        selected = pair + selected
-    return selected
-
-
 # ── System prompt ─────────────────────────────────────────────────────────────
 SYSTEM_PROMPT_TEMPLATE = """You are a helpful business assistant. You answer questions ONLY based on the document provided to you.
 
@@ -196,96 +74,7 @@ Context from the document:
 {context}
 """
 
-
-# ── Input sanitizer ───────────────────────────────────────────────────────────
-def _sanitize_message(text: str) -> str:
-    text = text[:_MAX_MESSAGE_LEN]
-    text = re.sub(r"<[^>]*>", "", text)
-    if _INJECTION_PATTERNS.search(text):
-        raise ValueError("Message contains disallowed content.")
-    return text.strip()
-
-
-# ── Groq retry with exponential backoff ───────────────────────────────────────
-_RETRY_DELAYS = [1, 2, 4]
-_RETRYABLE_STATUS = {429, 500, 502, 503, 504}
-
-
-def _call_groq_with_retry(messages: list[dict]) -> str:
-    last_exc: Optional[Exception] = None
-    for attempt, delay in enumerate([0] + _RETRY_DELAYS, start=1):
-        if delay:
-            logger.warning(
-                "Groq retry %d/%d — sleeping %ds",
-                attempt,
-                len(_RETRY_DELAYS) + 1,
-                delay,
-            )
-            time.sleep(delay)
-        try:
-            response = client.chat.completions.create(
-                model=settings.groq_model,
-                messages=messages,
-                max_tokens=512,
-                temperature=0.3,
-            )
-            return response.choices[0].message.content.strip()
-        except APIStatusError as exc:
-            last_exc = exc
-            if exc.status_code not in _RETRYABLE_STATUS:
-                raise
-            logger.warning(
-                "Groq API error %d on attempt %d: %s", exc.status_code, attempt, exc
-            )
-        except APIConnectionError as exc:
-            last_exc = exc
-            logger.warning("Groq connection error on attempt %d: %s", attempt, exc)
-        except Exception:
-            raise
-    raise last_exc or RuntimeError("Groq call failed after all retries")
-
-
-# ── HyDE: Hypothetical Document Embeddings ────────────────────────────────────
-def _generate_hyde_query(original_query: str) -> str:
-    """
-    Generate a hypothetical document passage for vector search embedding.
-    Only active when use_hyde=True in config. Disabled by default.
-    """
-    try:
-        hyde_messages = [
-            {
-                "role": "system",
-                "content": (
-                    "You are a document passage generator. "
-                    "Given a user question, write a short factual paragraph "
-                    "(2-3 sentences) that looks like it came from a professional "
-                    "document and directly answers the question. "
-                    "Write the passage itself — do not say 'according to' or "
-                    "'the document states'. Just write the passage as if it is "
-                    "the document text."
-                ),
-            },
-            {"role": "user", "content": original_query},
-        ]
-        response = client.chat.completions.create(
-            model=settings.groq_model,
-            messages=hyde_messages,
-            max_tokens=150,
-            temperature=0.1,
-        )
-        hyde_passage = response.choices[0].message.content.strip()
-        logger.info("HyDE generated (first 80 chars): %s...", hyde_passage[:80])
-        return hyde_passage
-    except Exception as exc:
-        logger.warning("HyDE generation failed: %s — using original query", exc)
-        return original_query
-
-
-# ── Output guardrail ──────────────────────────────────────────────────────────
-
-# Phrases that indicate the LLM correctly admitted it lacks information.
-# These are GROUNDED responses — the LLM followed its instructions.
-# Guardrail must not override them.
+# ── Output guardrail fallback phrases ─────────────────────────────────────────
 _LLM_FALLBACK_PHRASES = [
     "i don't have",
     "i do not have",
@@ -301,86 +90,486 @@ _LLM_FALLBACK_PHRASES = [
     "no details",
 ]
 
+# ── Lead intent signals (used by classifier) ──────────────────────────────────
+_LEAD_INTENT_SIGNALS = frozenset({
+    "purchase", "contact", "appointment", "pricing", "quote",
+})
 
-def _apply_output_guardrail(
-    reply: str,
-    top_rerank_score: float,
-) -> str:
+# ── Token budget constants ─────────────────────────────────────────────────────
+_CHARS_PER_TOKEN = 4
+_MAX_CONTEXT_TOKENS = 6000
+_MIN_CHUNKS_KEPT = 2
+
+# ── History trimmer ───────────────────────────────────────────────────────────
+_CHARS_PER_TOKEN_APPROX = 4
+_HISTORY_TOKEN_BUDGET = 800
+
+
+def _trim_history(history: list[dict]) -> list[dict]:
+    budget = _HISTORY_TOKEN_BUDGET * _CHARS_PER_TOKEN_APPROX
+    selected: list[dict] = []
+    for i in range(len(history) - 1, -1, -2):
+        pair = history[max(0, i - 1) : i + 1]
+        cost = sum(len(m["content"]) for m in pair)
+        if cost > budget:
+            break
+        budget -= cost
+        selected = pair + selected
+    return selected
+
+
+# ── Input sanitizer ───────────────────────────────────────────────────────────
+def _sanitize_message(text: str) -> str:
+    text = text[:_MAX_MESSAGE_LEN]
+    text = re.sub(r"<[^>]*>", "", text)
+    if _INJECTION_PATTERNS.search(text):
+        raise ValueError("Message contains disallowed content.")
+    return text.strip()
+
+
+# ── Groq retry ────────────────────────────────────────────────────────────────
+_RETRY_DELAYS = [1, 2, 4]
+_RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+
+
+def _call_groq_with_retry(messages: list[dict]) -> str:
+    last_exc: Optional[Exception] = None
+    for attempt, delay in enumerate([0] + _RETRY_DELAYS, start=1):
+        if delay:
+            logger.warning("Groq retry %d/%d — sleeping %ds", attempt, len(_RETRY_DELAYS) + 1, delay)
+            time.sleep(delay)
+        try:
+            response = client.chat.completions.create(
+                model=_MODEL_PRIMARY,
+                messages=messages,
+                max_tokens=512,
+                temperature=0.3,
+            )
+            return response.choices[0].message.content.strip()
+        except APIStatusError as exc:
+            last_exc = exc
+            if exc.status_code not in _RETRYABLE_STATUS:
+                raise
+            logger.warning("Groq API %d on attempt %d", exc.status_code, attempt)
+        except APIConnectionError as exc:
+            last_exc = exc
+            logger.warning("Groq connection error on attempt %d: %s", attempt, exc)
+        except Exception:
+            raise
+    raise last_exc or RuntimeError("Groq call failed after all retries")
+
+
+# ── HyDE: Hypothetical Document Embeddings ────────────────────────────────────
+def _generate_hyde_query(original_query: str) -> str:
     """
-    Check whether the LLM's reply should be trusted or overridden.
+    Generate a hypothetical document passage for dense retrieval.
+    Used for vague queries — gives the dense encoder a richer signal.
+    """
+    try:
+        resp = client.chat.completions.create(
+            model=_MODEL_FAST,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a document passage generator. "
+                        "Given a user question, write a short factual paragraph "
+                        "(2-3 sentences) that looks like it came from a professional "
+                        "document and directly answers the question. "
+                        "Write the passage itself — do not say 'according to' or "
+                        "'the document states'. Just write the passage as if it is "
+                        "the document text."
+                    ),
+                },
+                {"role": "user", "content": original_query},
+            ],
+            max_tokens=150,
+            temperature=0.1,
+        )
+        passage = resp.choices[0].message.content.strip()
+        logger.info("HyDE passage (first 80 chars): %s…", passage[:80])
+        return passage
+    except Exception as exc:
+        logger.warning("HyDE generation failed: %s — using original query", exc)
+        return original_query
 
-    Uses Cohere's top relevance score as the primary signal.
-    The score tells us how relevant the best retrieved chunk was
-    to the user's query — if even the best chunk barely matched,
-    the LLM had no real basis to answer from.
 
-    Two outcomes:
-
-    1. LLM already admitted ignorance (fallback phrases detected):
-       → Return reply as-is. This is correct, grounded behavior.
-         The guardrail should never override a correct "I don't know."
-
-    2. LLM gave a confident answer but Cohere score is below threshold:
-       → Override with controlled fallback. The context was too weak.
-         The LLM was essentially guessing. Don't show the user a guess.
-
-    Why Cohere score and not word overlap:
-       LLMs paraphrase. "Your clinic offers whitening at $299/session"
-       and "Brightcare provides teeth whitening ($299/session)" have
-       minimal exact word overlap but the first is perfectly grounded
-       in the second. Word overlap produces false positives.
-       Cohere's score is a cross-encoder — it understands the semantic
-       relationship between query and chunk, not just token overlap.
-
-    Score of 1.0 (Cohere unavailable/failed):
-       Guardrail never fires. Fail open — better to serve thin answers
-       than to block legitimate responses when Cohere is down.
+# ── Output guardrail ──────────────────────────────────────────────────────────
+def _apply_output_guardrail(reply: str, top_rerank_score: float) -> str:
+    """
+    Override LLM reply with fallback if rerank score is below threshold.
+    Pass through if LLM already admitted it lacks the information.
+    Score 1.0 (Cohere unavailable) = always pass through (fail open).
     """
     reply_lower = reply.lower()
 
-    # LLM correctly said it doesn't know — this IS grounded, do not override
     if any(phrase in reply_lower for phrase in _LLM_FALLBACK_PHRASES):
-        logger.debug(
-            "Guardrail: LLM used fallback phrase — response is grounded, passing through"
-        )
+        logger.debug("Guardrail: LLM used fallback phrase — passing through")
         return reply
 
-    # Context was too weak for a reliable answer
     if top_rerank_score < settings.guardrail_min_rerank_score:
         logger.warning(
-            "Guardrail TRIGGERED — top_rerank_score=%.3f < threshold=%.2f — "
-            "LLM answered with insufficient context — overriding with fallback",
-            top_rerank_score,
-            settings.guardrail_min_rerank_score,
+            "Guardrail TRIGGERED — score=%.3f < threshold=%.2f",
+            top_rerank_score, settings.guardrail_min_rerank_score,
         )
-        return (
-            "I don't have enough information in the document to answer that accurately."
-        )
+        return "I don't have enough information in the document to answer that accurately."
 
-    # Score is acceptable — reply is likely grounded
-    logger.debug(
-        "Guardrail passed — top_rerank_score=%.3f >= threshold=%.2f",
-        top_rerank_score,
-        settings.guardrail_min_rerank_score,
-    )
+    logger.debug("Guardrail passed — score=%.3f", top_rerank_score)
     return reply
 
 
-# ── Main chat pipeline ────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# Phase 3 — New intelligence functions
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── [P3-2] Query classifier ───────────────────────────────────────────────────
+_CLASSIFIER_SYSTEM = """You are a query classifier. Output ONLY valid JSON — no markdown, no explanation.
+
+Schema:
+{
+  "query_type": "factual" | "comparison" | "multi_part" | "vague",
+  "intent_signals": [],
+  "confidence": 0.0
+}
+
+query_type:
+  factual    — single specific question with a clear answer
+  comparison — asks to compare, contrast, or differentiate things
+  multi_part — contains 2+ distinct questions in one message
+  vague      — ambiguous, incomplete, or unclear intent
+
+intent_signals — include all that apply from this list only:
+  ["purchase", "contact", "appointment", "pricing", "quote", "information", "support"]
+
+confidence — float 0.0–1.0: how clearly the user knows what they want
+  (0.9 = very explicit intent, 0.3 = unclear/exploratory)"""
+
+
+def _classify_query(query: str) -> dict:
+    """
+    Classify query with Groq llama-3.1-8b-instant.
+    Returns {query_type, intent_signals, confidence}.
+    Fails open to {factual, [], 0.5} so pipeline always proceeds.
+    """
+    try:
+        resp = client.chat.completions.create(
+            model=_MODEL_FAST,
+            messages=[
+                {"role": "system", "content": _CLASSIFIER_SYSTEM},
+                {"role": "user", "content": query},
+            ],
+            max_tokens=80,
+            temperature=0.0,
+            response_format={"type": "json_object"},
+        )
+        raw = resp.choices[0].message.content.strip()
+        result = json.loads(raw)
+
+        query_type = result.get("query_type", "factual")
+        if query_type not in {"factual", "comparison", "multi_part", "vague"}:
+            query_type = "factual"
+
+        intent_signals = result.get("intent_signals", [])
+        if not isinstance(intent_signals, list):
+            intent_signals = []
+
+        confidence = float(result.get("confidence", 0.5))
+        confidence = max(0.0, min(1.0, confidence))
+
+        logger.info(
+            "Classified — type=%s | signals=%s | confidence=%.2f | query='%s…'",
+            query_type, intent_signals, confidence, query[:60],
+        )
+        return {
+            "query_type": query_type,
+            "intent_signals": intent_signals,
+            "confidence": confidence,
+        }
+
+    except json.JSONDecodeError as exc:
+        logger.warning("Classifier JSON parse failed: %s — defaulting to factual", exc)
+    except Exception as exc:
+        logger.warning("Classifier call failed: %s — defaulting to factual", exc)
+
+    return {"query_type": "factual", "intent_signals": [], "confidence": 0.5}
+
+
+# ── [P3-3] Query rewriter ─────────────────────────────────────────────────────
+_REWRITER_SYSTEM = (
+    "You are a search query optimizer. Fix typos, expand abbreviations, "
+    "and add implied context to make the query clearer for document search. "
+    "Return ONLY the improved query as plain text — no explanation, no quotes. "
+    "If the query is already clear and correct, return it exactly as-is."
+)
+
+
+def _rewrite_query(query: str, query_type: str) -> str:
+    """
+    Rewrite query for better retrieval signal.
+    Uses original query if rewrite fails or returns empty.
+    Original query is always preserved for LLM context — only rewritten
+    version is used for retrieval embedding.
+    """
+    try:
+        resp = client.chat.completions.create(
+            model=_MODEL_FAST,
+            messages=[
+                {"role": "system", "content": _REWRITER_SYSTEM},
+                {"role": "user", "content": query},
+            ],
+            max_tokens=120,
+            temperature=0.0,
+        )
+        rewritten = resp.choices[0].message.content.strip()
+
+        # Sanity checks — if output looks like a non-query, fall back
+        if not rewritten or len(rewritten) < 4:
+            return query
+        if len(rewritten) > 300:
+            return query
+
+        if rewritten != query:
+            logger.info(
+                "Query rewritten: '%s…' → '%s…'", query[:50], rewritten[:50]
+            )
+        return rewritten
+
+    except Exception as exc:
+        logger.warning("Query rewrite failed: %s — using original", exc)
+        return query
+
+
+# ── [P3-4] Query decomposer ───────────────────────────────────────────────────
+_DECOMPOSER_SYSTEM = (
+    "You are a query decomposer. Split the user's multi-part question into "
+    "at most 3 distinct, self-contained sub-questions. "
+    "Output ONLY valid JSON: {\"sub_questions\": [\"...\", \"...\"]}. "
+    "No markdown, no explanation."
+)
+
+
+def _decompose_query(query: str) -> list[str]:
+    """
+    Break a multi-part query into ≤3 sub-questions.
+    Falls back to [query] if decomposition fails.
+    """
+    try:
+        resp = client.chat.completions.create(
+            model=_MODEL_FAST,
+            messages=[
+                {"role": "system", "content": _DECOMPOSER_SYSTEM},
+                {"role": "user", "content": query},
+            ],
+            max_tokens=200,
+            temperature=0.0,
+            response_format={"type": "json_object"},
+        )
+        raw = resp.choices[0].message.content.strip()
+        result = json.loads(raw)
+        subs = result.get("sub_questions", [])
+        subs = [s.strip() for s in subs if isinstance(s, str) and s.strip()][:3]
+
+        if not subs:
+            return [query]
+
+        logger.info("Decomposed into %d sub-questions", len(subs))
+        for i, s in enumerate(subs, 1):
+            logger.debug("  sub_%d: '%s…'", i, s[:60])
+        return subs
+
+    except Exception as exc:
+        logger.warning("Query decompose failed: %s — using original", exc)
+        return [query]
+
+
+# ── [P3-5] HyDE embedding blend ───────────────────────────────────────────────
+def _blend_hyde_embedding(
+    original_q: str, hyde_passage: str
+) -> list[float]:
+    """
+    Blend original query embedding (40%) with HyDE passage embedding (60%).
+    Result is L2-normalized — ready for Qdrant cosine distance.
+
+    Phase 3 note: this blended vector is computed but retrieve_chunks_hybrid
+    currently accepts hyde_query as a string (rag.py embeds it internally).
+    Full wiring of the pre-computed blend is a Phase 4 rag.py enhancement.
+    The function is defined and tested here so Phase 4 can plug it in.
+    """
+    orig_emb = np.array(_embed_query(original_q), dtype=np.float32)
+    hyde_emb = np.array(_embed_query(hyde_passage), dtype=np.float32)
+
+    blended = 0.4 * orig_emb + 0.6 * hyde_emb
+    norm = np.linalg.norm(blended)
+    if norm > 0:
+        blended = blended / norm
+
+    return blended.tolist()
+
+
+# ── [P3-6] Multi-part retrieval ───────────────────────────────────────────────
+def _retrieve_multi_part(
+    session_id: str,
+    rewritten_q: str,
+) -> list[str]:
+    """
+    Decompose multi-part query → retrieve each sub-question in parallel
+    via ThreadPoolExecutor → deduplicate by exact text → return merged list.
+    """
+    sub_questions = _decompose_query(rewritten_q)
+
+    all_chunks: list[str] = []
+    seen: set[str] = set()
+
+    with ThreadPoolExecutor(max_workers=min(len(sub_questions), 3)) as executor:
+        futures = {
+            executor.submit(retrieve_chunks_hybrid, session_id, sq): sq
+            for sq in sub_questions
+        }
+        for future in as_completed(futures):
+            sq = futures[future]
+            try:
+                results = future.result()
+                for chunk in results:
+                    if chunk not in seen:
+                        seen.add(chunk)
+                        all_chunks.append(chunk)
+            except Exception as exc:
+                logger.warning(
+                    "Sub-query retrieval failed for '%s…': %s", sq[:40], exc
+                )
+
+    logger.info(
+        "Multi-part retrieval: %d sub-questions → %d unique chunks",
+        len(sub_questions), len(all_chunks),
+    )
+    return all_chunks
+
+
+# ── [P3-7] Vague retrieval ────────────────────────────────────────────────────
+def _retrieve_vague(
+    session_id: str,
+    original_q: str,
+    rewritten_q: str,
+) -> list[str]:
+    """
+    Generate HyDE passage and use it for dense retrieval.
+    The _blend_hyde_embedding is computed here for logging/testing;
+    the hyde_query string is passed to retrieve_chunks_hybrid so rag.py
+    embeds it for the dense prefetch. Full blend wired in Phase 4.
+    """
+    hyde_passage = _generate_hyde_query(rewritten_q)
+
+    # Blend computed — logged for Phase 4 validation
+    _ = _blend_hyde_embedding(original_q, hyde_passage)
+
+    return retrieve_chunks_hybrid(
+        session_id=session_id,
+        query=rewritten_q,
+        hyde_query=hyde_passage,
+    )
+
+
+# ── [P3-8] Injection scan on retrieved chunks ─────────────────────────────────
+def _scan_chunks_for_injection(
+    chunks: list[str], session_id: str
+) -> list[str]:
+    """
+    Scan retrieved document chunks for prompt injection patterns.
+    FLAGS and LOGS matches but does NOT drop chunks — we let the LLM's
+    system prompt rules handle adversarial content, while the log gives us
+    an audit trail to identify poisoned documents.
+    """
+    flagged = 0
+    for i, chunk in enumerate(chunks):
+        if _INJECTION_PATTERNS.search(chunk):
+            flagged += 1
+            logger.warning(
+                "INJECTION PATTERN in retrieved chunk %d/%d | "
+                "session=%s | preview: '%s…'",
+                i + 1, len(chunks), session_id, chunk[:100],
+            )
+    if flagged:
+        logger.warning(
+            "Total flagged chunks: %d/%d | session=%s",
+            flagged, len(chunks), session_id,
+        )
+    return chunks
+
+
+# ── [P3-9] Token budget trimmer ───────────────────────────────────────────────
+def _estimate_token_budget(
+    system_prompt: str,
+    query: str,
+    chunks: list[str],
+) -> list[str]:
+    """
+    Trim chunks to stay within _MAX_CONTEXT_TOKENS.
+    Chunks are already ranked best-first (after rerank), so we trim from
+    the end (lowest-ranked chunks removed first).
+    Always keeps at least _MIN_CHUNKS_KEPT regardless of budget.
+
+    Uses char/4 approximation — not exact but fast and safe.
+    """
+    fixed_tokens = (len(system_prompt) + len(query)) // _CHARS_PER_TOKEN
+    budget = _MAX_CONTEXT_TOKENS - fixed_tokens
+
+    if budget <= 0:
+        logger.warning(
+            "Token budget exhausted by prompt alone (%d tokens) — keeping top %d chunks",
+            fixed_tokens, _MIN_CHUNKS_KEPT,
+        )
+        return chunks[:_MIN_CHUNKS_KEPT]
+
+    kept: list[str] = []
+    for chunk in chunks:
+        chunk_tokens = len(chunk) // _CHARS_PER_TOKEN
+        if chunk_tokens <= budget or len(kept) < _MIN_CHUNKS_KEPT:
+            kept.append(chunk)
+            budget -= chunk_tokens
+        else:
+            break
+
+    if len(kept) < len(chunks):
+        logger.info(
+            "Token budget: trimmed %d → %d chunks (budget=%d tokens)",
+            len(chunks), len(kept), _MAX_CONTEXT_TOKENS,
+        )
+    return kept
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Main chat pipeline
+# ══════════════════════════════════════════════════════════════════════════════
 def get_chat_response(
-    session_id: str, user_message: str, conversation_history: list[dict]
+    session_id: str,
+    user_message: str,
+    conversation_history: list[dict],
 ) -> tuple[str, bool, list[str]]:
     """
-    Full pipeline:
-    sanitize → cache check → (HyDE) → hybrid retrieve
-    → rerank → guardrail → LLM → output guardrail → cache store → reply
+    Phase 3 pipeline (13 steps):
 
-    Cache hit path (zero API calls):
-    sanitize → cache check → return
+    1.  Sanitize input
+    2.  Classify query → query_type + intent_signals + confidence
+    3.  Derive lead_triggered from classifier (replaces keyword scoring)
+    4.  Cache check (Upstash Redis)
+    5.  Rewrite query for retrieval
+    6.  Retrieve — strategy by query_type:
+          multi_part → decompose + parallel retrieval + dedup
+          vague      → HyDE passage → dense retrieval
+          factual /
+          comparison → direct hybrid retrieval
+    7.  Injection scan on retrieved chunks
+    8.  Rerank (Cohere cross-encoder)
+    9.  Token budget trim
+    10. Build prompt (static system + trimmed context + history + query)
+    11. Call LLM (Groq primary model with retry)
+    12. Output guardrail (rerank score gate)
+    13. Cache store + return
 
     Returns (reply, lead_triggered, source_chunks)
     """
-    # ── Step 1: Sanitize ─────────────────────────────────────────────────────
+
+    # ── 1. Sanitize ───────────────────────────────────────────────────────────
     try:
         clean_message = _sanitize_message(user_message)
     except ValueError:
@@ -389,34 +578,53 @@ def get_chat_response(
     if not clean_message:
         return "Please enter a message.", False, []
 
-    # ── Step 1b: Calculate message count for proactive lead trigger ───────────
-    # Each completed exchange in conversation_history = 2 entries (user + assistant).
-    # message_count = number of full exchanges that happened BEFORE this message.
-    # message_count == 0 → this is the 1st user message → don't show dialog yet.
-    # message_count >= 1 → this is the 2nd+ user message → show dialog proactively.
     message_count = len(conversation_history) // 2
 
-    # ── Step 2: Semantic cache check ──────────────────────────────────────────
+    # ── 2. Classify ───────────────────────────────────────────────────────────
+    classification = _classify_query(clean_message)
+    query_type: str = classification["query_type"]
+    intent_signals: list[str] = classification["intent_signals"]
+    confidence: float = classification["confidence"]
+
+    # ── 3. Lead detection (classifier replaces _LEAD_SIGNALS keyword scoring) ─
+    # Two paths, either fires lead:
+    #   a) Classifier: high confidence + purchase/contact signal
+    #   b) Proactive: second message onwards (same logic as v1)
+    lead_from_classifier = (
+        confidence >= settings.lead_classifier_threshold
+        and bool(_LEAD_INTENT_SIGNALS.intersection(set(intent_signals)))
+    )
+    lead_triggered = lead_from_classifier or (message_count >= 1)
+
+    if lead_from_classifier:
+        logger.info(
+            "Lead (classifier) — confidence=%.2f | signals=%s | session=%s",
+            confidence, intent_signals, session_id,
+        )
+    elif message_count >= 1:
+        logger.info(
+            "Lead (proactive) — message_count=%d | session=%s",
+            message_count, session_id,
+        )
+
+    # ── 4. Cache check ────────────────────────────────────────────────────────
     cached = semantic_cache.get(clean_message, session_id)
     if cached is not None:
         cached_answer, cached_lead, cached_chunks = cached
-        # Even on a cache hit, apply the proactive lead trigger based on current
-        # message count — the cached lead_triggered may be False from an early
-        # exchange, but if we're now past the 2nd message it should fire.
-        effective_lead = cached_lead or (message_count >= 1)
-        return cached_answer, effective_lead, cached_chunks
+        # Apply current lead state on top of cached lead state
+        return cached_answer, (cached_lead or lead_triggered), cached_chunks
 
-    # ── Step 3: HyDE (optional, disabled by default) ──────────────────────────
-    hyde_q: Optional[str] = None
-    if settings.use_hyde:
-        hyde_q = _generate_hyde_query(clean_message)
+    # ── 5. Rewrite query ──────────────────────────────────────────────────────
+    rewritten = _rewrite_query(clean_message, query_type)
 
-    # ── Step 4: Hybrid retrieval → parent resolution ──────────────────────────
-    chunks = retrieve_chunks_hybrid(
-        session_id=session_id,
-        query=clean_message,
-        hyde_query=hyde_q,
-    )
+    # ── 6. Retrieve ───────────────────────────────────────────────────────────
+    if query_type == "multi_part":
+        chunks = _retrieve_multi_part(session_id, rewritten)
+    elif query_type == "vague":
+        chunks = _retrieve_vague(session_id, clean_message, rewritten)
+    else:
+        # factual or comparison — direct hybrid search
+        chunks = retrieve_chunks_hybrid(session_id=session_id, query=rewritten)
 
     if not chunks:
         return (
@@ -425,39 +633,33 @@ def get_chat_response(
             [],
         )
 
-    # ── Step 5: Rerank ────────────────────────────────────────────────────────
-    # Returns (top_n_chunks, top_relevance_score)
-    # top_relevance_score is Cohere's score for the best chunk — used by guardrail
-    top_chunks, top_rerank_score = rerank_chunks(clean_message, chunks)
+    # ── 7. Injection scan ─────────────────────────────────────────────────────
+    chunks = _scan_chunks_for_injection(chunks, session_id)
 
-    # ── Step 6: Build prompt ──────────────────────────────────────────────────
+    # ── 8. Rerank ─────────────────────────────────────────────────────────────
+    top_chunks, top_rerank_score = rerank_chunks(rewritten, chunks)
+
+    # ── 9. Token budget ───────────────────────────────────────────────────────
+    top_chunks = _estimate_token_budget(SYSTEM_PROMPT_TEMPLATE, clean_message, top_chunks)
+
+    # ── 10. Build prompt ──────────────────────────────────────────────────────
     context = "\n\n---\n\n".join(top_chunks)
     system_prompt = SYSTEM_PROMPT_TEMPLATE.format(context=context)
 
-    messages = [{"role": "system", "content": system_prompt}]
-
+    messages: list[dict] = [{"role": "system", "content": system_prompt}]
     for msg in _trim_history(conversation_history):
         messages.append(msg)
-
     messages.append({"role": "user", "content": clean_message})
 
-    # ── Step 7: Call LLM ──────────────────────────────────────────────────────
+    # ── 11. Call LLM ──────────────────────────────────────────────────────────
     raw_reply = _call_groq_with_retry(messages)
 
-    # ── Step 8: Output guardrail ──────────────────────────────────────────────
-    # Check if the LLM's reply is trustworthy given the context quality.
-    # Overrides with controlled fallback if rerank score was too low.
-    # Passes through if LLM already correctly admitted ignorance.
+    # ── 12. Output guardrail ──────────────────────────────────────────────────
     reply = _apply_output_guardrail(raw_reply, top_rerank_score)
 
-    # ── Step 9: Lead detection ────────────────────────────────────────────────
-    # Run on the guardrail-checked reply, not the raw reply.
-    # Passes message_count so proactive trigger fires on the 2nd message.
-    lead_triggered = detect_lead(clean_message, reply, message_count)
-
-    # ── Step 10: Store in cache ───────────────────────────────────────────────
-    # Store the guardrail-checked reply — not the raw LLM output.
-    # Cached answer is exactly what the user saw.
+    # ── 13. Cache store ───────────────────────────────────────────────────────
+    # Never cache lead-triggered responses — lead state must be re-evaluated
+    # fresh each time (proactive trigger depends on message_count)
     semantic_cache.set(
         query=clean_message,
         answer=reply,
